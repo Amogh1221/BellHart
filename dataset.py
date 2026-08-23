@@ -111,7 +111,7 @@ def create_streaming_dataloaders(
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        num_workers=1, # Fewer workers needed for validation
+        num_workers=num_workers, # Use the same worker count as train
         pin_memory=pin_memory,
         drop_last=True,
     )
