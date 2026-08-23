@@ -593,6 +593,10 @@ class Trainer:
                 scaler.scale(loss).backward()
 
             self.micro_step += 1
+            if pbar:
+                micro = self.micro_step % config.gradient_accumulation_steps
+                if micro == 0: micro = config.gradient_accumulation_steps
+                pbar.set_description(f"Training (Micro {micro}/{config.gradient_accumulation_steps})")
 
             # ── Prevent CPU RAM OOM during compilation ──────────────────
             # Unrolling 10 micro-steps into a single XLA graph consumes >30GB of CPU RAM
@@ -682,14 +686,18 @@ class Trainer:
                         avg_gn = self._grad_norm_sum / max(self._grad_norm_count, 1)
 
                     # Terminal
-                    print(
-                        f"\r[Step {self.iter_num:>7d}/{config.max_iters}]  "
+                    log_str = (
+                        f"[Step {self.iter_num:>7d}/{config.max_iters}]  "
                         f"loss={avg_loss:.4f}  lr={lr:.2e}  "
                         f"grad_norm={avg_gn:.3f}  "
                         f"tok/s={tok_sec:,.0f}  "
                         f"VRAM={vram_alloc:.1f}/{vram_total:.1f}GB  "
                         f"ETA={eta_str}"
                     )
+                    if pbar:
+                        pbar.write(log_str)
+                    else:
+                        print(log_str)
 
                     # TensorBoard
                     if self.writer:
@@ -758,21 +766,30 @@ class Trainer:
                         delta_val = val_loss - self.best_val_loss if self.best_val_loss < float("inf") else 0.0
                         delta_str = f"Δ: {delta_val:+.4f}" if not is_best else "NEW BEST ★"
 
-                        print(f"\n{hr}")
-                        print(f"  EVALUATION @ Step {self.iter_num} / {config.max_iters}   ({pct:.1f}%)")
-                        print(hr)
-                        print(f"  Train Loss     : {train_loss:.4f}")
-                        print(f"  Val Loss       : {val_loss:.4f}  (best: {self.best_val_loss:.4f}  {delta_str})")
-                        print(f"  Perplexity     : {ppl:.2f}")
+                        # Terminal — structured eval block
+                        eval_str = (
+                            f"\n{hr}\n"
+                            f"  EVALUATION @ Step {self.iter_num} / {config.max_iters}   ({pct:.1f}%)\n"
+                            f"{hr}\n"
+                            f"  Train Loss     : {train_loss:.4f}\n"
+                            f"  Val Loss       : {val_loss:.4f}  (best: {self.best_val_loss:.4f}  {delta_str})\n"
+                            f"  Perplexity     : {ppl:.2f}\n"
+                        )
                         if ema_val is not None:
-                            print(f"  EMA Val Loss   : {ema_val:.4f}")
-                        print(f"  Learning Rate  : {lr:.2e}")
-                        print(f"  Avg Grad Norm  : {avg_gn:.3f}")
-                        print(f"  Tokens/sec     : {tok_sec:,.0f}")
-                        print(f"  VRAM           : {vram_alloc:.1f} / {vram_total:.1f} GB")
-                        print(f"  Elapsed        : {_format_elapsed(elapsed)}")
-                        print(f"  ETA            : {_format_eta(eta)}")
-                        print(hr)
+                            eval_str += f"  EMA Val Loss   : {ema_val:.4f}\n"
+                        eval_str += (
+                            f"  Learning Rate  : {lr:.2e}\n"
+                            f"  Avg Grad Norm  : {avg_gn:.3f}\n"
+                            f"  Tokens/sec     : {tok_sec:,.0f}\n"
+                            f"  VRAM           : {vram_alloc:.1f} / {vram_total:.1f} GB\n"
+                            f"  Elapsed        : {_format_elapsed(elapsed)}\n"
+                            f"  ETA            : {_format_eta(eta)}\n"
+                            f"{hr}"
+                        )
+                        if pbar:
+                            pbar.write(eval_str)
+                        else:
+                            print(eval_str)
 
                         # File log — structured eval block
                         if self.flog:
@@ -829,6 +846,7 @@ class Trainer:
 
                 self.iter_num += 1
                 self._steps_taken_since_resume += 1
+                
                 if pbar:
                     pbar.update(1)
 
