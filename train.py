@@ -304,6 +304,11 @@ def _tpu_worker_wrapper(index, hf_token):
     # CRITICAL: Tell PJRT this is a multi-process run, otherwise the C++ client segfaults!
     os.environ['PJRT_LOCAL_PROCESS_COUNT'] = '8'
     os.environ['PJRT_LOCAL_PROCESS_RANK'] = str(index)
+    os.environ['WORLD_SIZE'] = '8'
+    os.environ['RANK'] = str(index)
+    # PJRT also requires a master address for its internal GRPC rendezvous
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
     
     _train_worker(index, hf_token)
 
