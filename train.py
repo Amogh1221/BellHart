@@ -337,18 +337,12 @@ def main():
     if USE_TPU:
         os.environ["PJRT_DEVICE"] = "TPU"
         
-        # Check if already inside an active multi-core TPU process (e.g. via accelerate launch or xmp.spawn)
-        is_already_worker = False
-        try:
-            import torch_xla.runtime as xr
-            is_already_worker = xr.world_size() > 1 or xr.global_ordinal() > 0
-        except Exception:
-            pass
-
-        if not is_already_worker:
-            # Check accelerate env vars
-            if os.environ.get("ACCELERATE_USE_TPU", "").lower() == "true" or int(os.environ.get("RANK", -1)) != -1:
-                is_already_worker = True
+        # Check if already inside an active distributed worker process
+        is_already_worker = (
+            int(os.environ.get("RANK", -1)) != -1 
+            or int(os.environ.get("LOCAL_RANK", -1)) != -1
+            or os.environ.get("ACCELERATE_USE_TPU", "").lower() == "true"
+        )
 
         if is_already_worker:
             _train_worker(index_or_token=hf_token)
@@ -358,7 +352,7 @@ def main():
                 print("  BellHart — TPU Training Mode (8 cores)")
                 print("=" * 56)
             import torch_xla.distributed.xla_multiprocessing as xmp
-            # In PJRT, nprocs=None automatically uses all 8 TPU cores
+            # In PJRT, nprocs=None automatically uses all 8 TPU cores cleanly
             xmp.spawn(_train_worker, args=(hf_token,), nprocs=None)
     else:
         if _is_proc_master():
