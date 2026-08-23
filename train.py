@@ -95,10 +95,16 @@ def setup_environment(config: GPTConfig):
             print(f"Dtype: bfloat16 (native TPU)")
 
 
-def _train_worker(index=None, hf_token=None):
+def _train_worker(index_or_token=None, hf_token=None):
     """
     Core training function. Runs once on GPU, or is spawned per-core on TPU.
     """
+    if hf_token is None and isinstance(index_or_token, str):
+        hf_token = index_or_token
+        index = None
+    else:
+        index = index_or_token
+
     is_ddp = int(os.environ.get('RANK', -1)) != -1
     
     if USE_TPU:
@@ -315,13 +321,17 @@ def main():
             print("=" * 56)
             print("  BellHart — TPU Training Mode (Distributed)")
             print("=" * 56)
-            _train_worker(index=None, hf_token=args.hf_token)
+            _train_worker(index_or_token=args.hf_token)
         else:
             print("=" * 56)
-            print("  BellHart — TPU Training Mode (xmp.spawn 8 cores)")
+            print("  BellHart — TPU Training Mode (Accelerate Launcher 8 cores)")
             print("=" * 56)
-            import torch_xla.distributed.xla_multiprocessing as xmp
-            xmp.spawn(_train_worker, args=(args.hf_token,), nprocs=8)
+            try:
+                from accelerate import notebook_launcher
+                notebook_launcher(_train_worker, args=(args.hf_token,), num_processes=8)
+            except Exception:
+                import torch_xla.distributed.xla_multiprocessing as xmp
+                xmp.spawn(_train_worker, args=(args.hf_token,), nprocs=8)
     else:
         print("=" * 56)
         print("  BellHart — GPU Training Mode")
@@ -333,7 +343,7 @@ def main():
         else:
             print(f"Authenticating with HuggingFace...")
             
-        _train_worker(index=None, hf_token=args.hf_token)
+        _train_worker(index_or_token=args.hf_token)
 
     if is_ddp and not USE_TPU:
         import torch.distributed as dist
