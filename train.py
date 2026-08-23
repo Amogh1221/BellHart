@@ -11,7 +11,6 @@ os.environ.pop('CLOUD_TPU_TASK_ID', None)
 from huggingface_hub import login, hf_hub_download
 
 # ── TPU Detection ────────────────────────────────────────────────────────────
-os.environ["PT_XLA_DEBUG"] = "1"  # Print XLA compilation metrics to show it's not frozen
 USE_TPU = False
 try:
     import torch_xla.core.xla_model as xm
@@ -292,7 +291,7 @@ def main():
         print("  BellHart — TPU Training Mode")
         print("=" * 56)
         # xmp.spawn launches _train_worker on all available TPU cores (1, 4, or 8)
-        xmp.spawn(_train_worker, args=(args.hf_token,), nprocs=None, start_method="fork")
+        xmp.spawn(_train_worker, args=(args.hf_token,), nprocs=None)
     else:
         print("=" * 56)
         print("  BellHart — GPU Training Mode")
