@@ -358,6 +358,8 @@ def main():
             int(os.environ.get("RANK", -1)) != -1 
             or int(os.environ.get("LOCAL_RANK", -1)) != -1
             or os.environ.get("ACCELERATE_USE_TPU", "").lower() == "true"
+            or "accelerate" in sys.argv[0].lower()
+            or "accelerate.commands" in sys.modules
         )
         if is_already_worker:
             _train_worker(index_or_token=hf_token)
