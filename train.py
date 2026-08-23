@@ -127,6 +127,18 @@ def _train_worker(index_or_token=None, hf_token=None):
     """
     Core training function. Runs once on GPU, or is spawned per-core on TPU.
     """
+    import os
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+    os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
     if hf_token is None and isinstance(index_or_token, str):
         hf_token = index_or_token
         index = None
