@@ -32,47 +32,57 @@ class HFStreamingDataset(IterableDataset):
         self.world_size = world_size
 
     def __iter__(self):
+        import time
         worker_info = torch.utils.data.get_worker_info()
         seed = self.seed
         if worker_info is not None:
-            # Different seed for each worker to ensure different shuffling
             seed += worker_info.id
-
-        log.info(f"Initializing stream for {self.dataset_name} ({self.config_name}) split: {self.split}")
-        # Load streaming dataset
-        if self.config_name:
-            dataset = load_dataset(self.dataset_name, self.config_name, split=self.split, streaming=True)
-        else:
-            dataset = load_dataset(self.dataset_name, split=self.split, streaming=True)
-            
-        # VERY IMPORTANT: Shard the dataset across GPUs/TPUs so they don't train on the same data
-        if self.world_size > 1:
-            dataset = dataset.shard(num_shards=self.world_size, index=self.rank)
-            
-        # Shuffle the stream
-        dataset = dataset.shuffle(buffer_size=self.buffer_size, seed=seed)
 
         buffer = []
         chunk_size = self.block_size + 1
+        retry_delay = 1.0
 
-        for example in dataset:
-            # Extract content. Works for openbmb/Ultra-FineWeb-L1 and similar text datasets.
-            text = example.get("content", example.get("text", ""))
-            if not text:
-                continue
+        while True:
+            try:
+                # Load streaming dataset
+                if self.config_name:
+                    dataset = load_dataset(self.dataset_name, self.config_name, split=self.split, streaming=True)
+                else:
+                    dataset = load_dataset(self.dataset_name, split=self.split, streaming=True)
+                    
+                # Shard the dataset across GPUs/TPUs so they don't train on the same data
+                if self.world_size > 1:
+                    dataset = dataset.shard(num_shards=self.world_size, index=self.rank)
+                    
+                # Shuffle the stream
+                dataset = dataset.shuffle(buffer_size=self.buffer_size, seed=seed)
 
-            # Tokenize
-            tokens = self.tokenizer.encode(text)
-            buffer.extend(tokens)
+                for example in dataset:
+                    text = example.get("content", example.get("text", ""))
+                    if not text:
+                        continue
 
-            # Yield chunks
-            while len(buffer) >= chunk_size:
-                chunk = buffer[:chunk_size]
-                buffer = buffer[chunk_size:]
+                    # Tokenize
+                    tokens = self.tokenizer.encode(text)
+                    buffer.extend(tokens)
+
+                    # Yield chunks
+                    while len(buffer) >= chunk_size:
+                        chunk = buffer[:chunk_size]
+                        buffer = buffer[chunk_size:]
+                        
+                        x = torch.tensor(chunk[:-1], dtype=torch.long)
+                        y = torch.tensor(chunk[1:], dtype=torch.long)
+                        yield x, y
                 
-                x = torch.tensor(chunk[:-1], dtype=torch.long)
-                y = torch.tensor(chunk[1:], dtype=torch.long)
-                yield x, y
+                # If stream finishes normally, advance seed and continue seamlessly
+                seed += 1
+                retry_delay = 1.0
+            except Exception as e:
+                # Catch transient HuggingFace network disconnections, SSL drops, rate limits
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 1.5, 10.0)
+                seed += 1
 
 def create_streaming_dataloaders(
     dataset_name: str,
