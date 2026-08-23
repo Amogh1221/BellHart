@@ -214,8 +214,11 @@ def _train_worker(index=None, hf_token=None):
 
     trainer = Trainer(config, tokenizer, train_loader, val_loader)
 
-    resume_path = "checkpoints/latest.pt"
-    if os.path.exists(resume_path):
+    import glob
+    checkpoints = glob.glob("checkpoints/checkpoint-*.pt")
+    if checkpoints:
+        # Sort by step number
+        resume_path = sorted(checkpoints, key=lambda x: int(x.split('-')[-1].split('.')[0]))[-1]
         trainer.load_checkpoint(resume_path)
 
     try:
@@ -223,8 +226,9 @@ def _train_worker(index=None, hf_token=None):
     except KeyboardInterrupt:
         if is_master:
             print("\nInterrupted, saving checkpoint...")
-            trainer.save_checkpoint("checkpoints/latest.pt", step_num=trainer.iter_num)
-            print("Checkpoint saved. Exiting.")
+            ckpt_path = f"checkpoints/checkpoint-{trainer.iter_num:06d}.pt"
+            trainer.save_checkpoint(ckpt_path, step_num=trainer.iter_num)
+            print(f"Checkpoint saved to {ckpt_path}. Exiting.")
         sys.exit(0)
 
 
