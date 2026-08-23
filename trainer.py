@@ -596,6 +596,8 @@ class Trainer:
                 )
                 loss = loss / config.gradient_accumulation_steps
                 loss.backward()
+                last_loss = loss.detach()
+                del logits, loss
             else:
                 # DDP no_sync: skip all-reduce on all micro-steps except the last
                 is_last_micro = (self.micro_step + 1) % config.gradient_accumulation_steps == 0
