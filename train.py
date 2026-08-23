@@ -234,7 +234,7 @@ def _train_worker(index_or_token=None, hf_token=None):
         config.grad_clip = 0.0
         # Disabled checkpointing for direct, single-graph execution
         config.gradient_checkpointing = 0
-        config.block_size = 2048
+        config.block_size = 4096
         config.batch_size = 1
         config.gradient_accumulation_steps = 1
         
