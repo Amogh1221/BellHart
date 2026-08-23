@@ -309,42 +309,51 @@ def _train_worker(index_or_token=None, hf_token=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hf_token", type=str, required=True, help="HuggingFace WRITE Token")
-    args = parser.parse_args()
+    parser.add_argument("--hf_token", type=str, default="", help="HuggingFace WRITE Token")
+    args, _ = parser.parse_known_args()
 
-    is_ddp = int(os.environ.get('RANK', -1)) != -1
+    hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
 
     if USE_TPU:
         os.environ["PJRT_DEVICE"] = "TPU"
-        if is_ddp:
-            print("=" * 56)
-            print("  BellHart — TPU Training Mode (Distributed)")
-            print("=" * 56)
-            _train_worker(index_or_token=args.hf_token)
+        
+        # Check if already inside an active multi-core TPU process (e.g. via accelerate launch or xmp.spawn)
+        is_already_worker = False
+        try:
+            import torch_xla.runtime as xr
+            is_already_worker = xr.world_size() > 1 or xr.global_ordinal() > 0
+        except Exception:
+            pass
+
+        if not is_already_worker:
+            # Check accelerate env vars
+            if os.environ.get("ACCELERATE_USE_TPU", "").lower() == "true" or int(os.environ.get("RANK", -1)) != -1:
+                is_already_worker = True
+
+        if is_already_worker:
+            _train_worker(index_or_token=hf_token)
         else:
             print("=" * 56)
-            print("  BellHart — TPU Training Mode (Accelerate Launcher 8 cores)")
+            print("  BellHart — TPU Training Mode (8 cores)")
             print("=" * 56)
-            try:
-                from accelerate import notebook_launcher
-                notebook_launcher(_train_worker, args=(args.hf_token,), num_processes=8)
-            except Exception:
-                import torch_xla.distributed.xla_multiprocessing as xmp
-                xmp.spawn(_train_worker, args=(args.hf_token,), nprocs=8)
+            import torch_xla.distributed.xla_multiprocessing as xmp
+            # In PJRT, nprocs=None automatically uses all 8 TPU cores
+            xmp.spawn(_train_worker, args=(hf_token,), nprocs=None)
     else:
         print("=" * 56)
         print("  BellHart — GPU Training Mode")
         print("=" * 56)
         
+        is_ddp = int(os.environ.get('RANK', -1)) != -1
         if is_ddp:
             if int(os.environ.get('RANK', 0)) == 0:
                 print(f"Authenticating with HuggingFace (DDP Master)...")
         else:
             print(f"Authenticating with HuggingFace...")
             
-        _train_worker(index_or_token=args.hf_token)
+        _train_worker(index_or_token=hf_token)
 
-    if is_ddp and not USE_TPU:
+    if not USE_TPU and int(os.environ.get('RANK', -1)) != -1:
         import torch.distributed as dist
         dist.destroy_process_group()
 
