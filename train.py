@@ -219,10 +219,9 @@ def _train_worker(index_or_token=None, hf_token=None):
         config.dtype = "bfloat16"
         config.compile = False
         config.fused_adam = False
-        config.grad_clip = 0.0  # Fuses optimizer step into a single XLA HLO kernel, reducing compilation RAM by 90%
-        # 2-stride gradient checkpointing splits the 52-layer model into 26 small,
-        # lightweight subgraphs of 2 layers each, reducing graph size and TPU HBM to just 11.1 GB.
-        config.gradient_checkpointing = 2
+        config.grad_clip = 0.0
+        # Disabled checkpointing for direct, single-graph execution
+        config.gradient_checkpointing = 0
         config.block_size = 2048
         config.batch_size = 1
         config.gradient_accumulation_steps = 1
@@ -239,7 +238,7 @@ def _train_worker(index_or_token=None, hf_token=None):
             print(f"TPU detected ({num_cores} cores)")
             print(f"block_size: {config.block_size}  batch_size: {config.batch_size}  grad_accum: {config.gradient_accumulation_steps}  "
                   f"(effective batch = {config.batch_size * num_cores * config.gradient_accumulation_steps} sequences = {config.batch_size * num_cores * config.block_size:,} tokens/step)")
-            print(f"gradient_checkpointing: {config.gradient_checkpointing} (2-stride modular subgraph compilation)")
+            print(f"gradient_checkpointing: {config.gradient_checkpointing} (Direct linear execution, no subgraphs)")
             print(f"preload forced to False to prevent CPU OOM")
     elif torch.cuda.is_available():
         # ── Dynamic GPU VRAM auto-scaling ─────────────────────────────────

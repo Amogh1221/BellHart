@@ -66,7 +66,7 @@ class GPTConfig:
     grad_clip: float = 1.0
 
     # Gradient checkpointing stride (0 = off, 1 = all blocks, 2 = every 2nd, etc.)
-    gradient_checkpointing: int = 2
+    gradient_checkpointing: int = 0
 
     # Preload dataset into RAM (disable for datasets larger than available RAM)
     preload: bool = False
