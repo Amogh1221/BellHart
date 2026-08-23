@@ -20,7 +20,7 @@ except ImportError:
     pass
 
 if not USE_TPU:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
 
 from config import GPTConfig
 from tokenizer import Tokenizer
@@ -186,7 +186,9 @@ def _train_worker(index=None, hf_token=None):
         if is_ampere_plus:
             config.dtype = "bfloat16"
             config.tf32 = True
-        # else: keep config.json defaults (float16, tf32=false)
+        else:
+            config.dtype = "float16"
+            config.tf32 = False
 
         if is_master:
             print(f"Auto-scaled for {vram_gb:.0f}GB VRAM → "
