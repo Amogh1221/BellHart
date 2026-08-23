@@ -11,6 +11,7 @@ os.environ.pop('CLOUD_TPU_TASK_ID', None)
 from huggingface_hub import login, hf_hub_download
 
 # ── TPU Detection ────────────────────────────────────────────────────────────
+os.environ["PT_XLA_DEBUG"] = "1"  # Print XLA compilation metrics to show it's not frozen
 USE_TPU = False
 try:
     import torch_xla.core.xla_model as xm
