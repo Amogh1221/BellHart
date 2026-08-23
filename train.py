@@ -59,6 +59,7 @@ def setup_environment(config: GPTConfig):
     if config.device == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = config.tf32
         torch.backends.cudnn.allow_tf32 = config.tf32
+        torch.backends.cudnn.benchmark = True  # Auto-tune kernels for fixed input sizes
         torch.cuda.reset_peak_memory_stats()
         gpu_name = torch.cuda.get_device_name(0)
         vram = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -240,7 +241,7 @@ def _train_worker(index=None, hf_token=None):
         tokenizer=tokenizer,
         block_size=config.block_size,
         batch_size=config.batch_size,
-        num_workers=0,
+        num_workers=1,
         seed=42 + seed_offset,
     )
 

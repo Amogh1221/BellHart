@@ -31,7 +31,7 @@ class GPTConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 0.1
     beta1: float = 0.95
-    beta2: float = 0.95
+    beta2: float = 0.99
     warmup_iters: int = 3000
     lr_decay_iters: int = 100000
     min_lr: float = 3e-5

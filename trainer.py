@@ -298,7 +298,7 @@ class Trainer:
             except StopIteration:
                 self.val_iter = iter(self.val_loader)
                 x, y = next(self.val_iter)
-        return x.to(self.device), y.to(self.device)
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
     @torch.no_grad()
     def estimate_loss(self):
@@ -526,6 +526,8 @@ class Trainer:
                 tps *= xr.world_size()
             except (ImportError, AttributeError):
                 tps *= xm.xrt_world_size()
+        elif self.is_ddp:
+            tps *= int(os.environ.get('WORLD_SIZE', 1))
         return tps
 
     def train(self):
@@ -603,7 +605,10 @@ class Trainer:
                             logits.view(-1, logits.size(-1)),
                             y.view(-1),
                         )
-                        loss = loss / config.gradient_accumulation_steps
+                        # Z-loss: prevents logit drift, improves stability (PaLM/Gemma)
+                        log_z = torch.logsumexp(logits.view(-1, logits.size(-1)).float(), dim=-1)
+                        z_loss = 1e-4 * (log_z ** 2).mean()
+                        loss = (loss + z_loss) / config.gradient_accumulation_steps
                     scaler.scale(loss).backward()
 
             self.micro_step += 1
