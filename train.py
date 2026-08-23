@@ -209,7 +209,7 @@ def _train_worker(index=None, hf_token=None):
         tokenizer=tokenizer,
         block_size=config.block_size,
         batch_size=config.batch_size,
-        num_workers=2,
+        num_workers=1,
     )
 
     trainer = Trainer(config, tokenizer, train_loader, val_loader)
