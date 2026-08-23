@@ -342,6 +342,19 @@ def _train_worker(index_or_token=None, hf_token=None):
         sys.exit(0)
 
 
+def run_notebook(hf_token: str = ""):
+    """Official Kaggle / Colab Notebook Launcher for PyTorch XLA."""
+    if USE_TPU:
+        try:
+            from accelerate import notebook_launcher
+            notebook_launcher(_train_worker, args=(hf_token,), num_processes=8)
+        except Exception:
+            import torch_xla.distributed.xla_multiprocessing as xmp
+            xmp.spawn(_train_worker, args=(hf_token,), nprocs=8, start_method="fork")
+    else:
+        _train_worker(index_or_token=hf_token)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hf_token", type=str, default="", help="HuggingFace WRITE Token")
