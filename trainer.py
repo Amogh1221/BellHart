@@ -246,8 +246,8 @@ class Trainer:
 
         if config.compile and hasattr(torch, "compile"):
             if self.is_master:
-                print("Compiling model...")
-            self.model = torch.compile(self.model, mode="default")
+                print("Compiling model.forward (regional)...")
+            self.model.forward = torch.compile(self.model.forward, mode="default")
 
         # Multi-device wrapping
         self.is_ddp = is_ddp
