@@ -364,7 +364,7 @@ def main():
                 print("  BellHart — TPU Training Mode (8 cores)")
                 print("=" * 56)
             import torch_xla.distributed.xla_multiprocessing as xmp
-            xmp.spawn(_train_worker, args=(hf_token,), nprocs=None)
+            xmp.spawn(_train_worker, args=(hf_token,), nprocs=8, start_method='fork')
     else:
         _train_worker(index_or_token=hf_token)
 
