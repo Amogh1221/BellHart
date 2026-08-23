@@ -330,7 +330,7 @@ class Trainer:
         self.model.train()
         return out
 
-    def save_checkpoint(self, path, is_best=False, step_num=None, max_ckpt=15, epoch_name=None):
+    def save_checkpoint(self, path, step_num=None, max_ckpt=3, epoch_name=None):
         if not self.is_master:
             return
 
@@ -349,12 +349,8 @@ class Trainer:
 
         if self.use_tpu:
             xm.save(ckpt, path)
-            if is_best:
-                xm.save(ckpt, "checkpoints/best.pt")
         else:
             torch.save(ckpt, path)
-            if is_best:
-                torch.save(ckpt, "checkpoints/best.pt")
 
         # Local cleanup
         if step_num is not None:
@@ -404,14 +400,7 @@ class Trainer:
                                     path_or_fileobj=sync_path
                                 ))
                                 
-                            # Add best checkpoint operation if applicable
-                            if is_best and os.path.exists("checkpoints/best.pt"):
-                                # We can upload best.pt directly since it's only updated rarely
-                                upload_ops.append(CommitOperationAdd(
-                                    path_in_repo="checkpoints/best.pt",
-                                    path_or_fileobj="checkpoints/best.pt"
-                                ))
-                                
+
                             # Add logs operation
                             if os.path.exists("logs/training_log.txt"):
                                 upload_ops.append(CommitOperationAdd(
@@ -843,9 +832,7 @@ class Trainer:
                     ckpt_path = f"checkpoints/checkpoint-{self.iter_num + 1:06d}.pt"
                     if is_best:
                         self.best_val_loss = val_loss
-                        self.save_checkpoint(ckpt_path, is_best=True, step_num=self.iter_num + 1)
-                    else:
-                        self.save_checkpoint(ckpt_path, step_num=self.iter_num + 1)
+                    self.save_checkpoint(ckpt_path, step_num=self.iter_num + 1)
 
                     # Defrag memory after eval's memory spike
                     if not self.use_tpu and torch.cuda.is_available():
