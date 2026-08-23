@@ -222,14 +222,12 @@ def _train_worker(index_or_token=None, hf_token=None):
         config.fused_adam = False
         config.gradient_checkpointing = 1
         config.block_size = 2048
-        # TPU v3 has 15.75G HBM per core — batch_size=1 with gradient checkpointing
-        # drops activation memory to <1GB HBM, fitting easily on all TPU variants.
-        original_effective_batch = config.batch_size * config.gradient_accumulation_steps
         config.batch_size = 1
+        # Set grad_accum = 1 on TPU so that the entire step is 1 simple unified graph
+        # across the 8 TPU cores (effective batch = 8 sequences = 16,384 tokens/step).
+        config.gradient_accumulation_steps = 1
         
         # ── OOM Prevention: Force memmap on TPU ──
-        # xmp.spawn launches 8 processes. If preload=True, the 8GB dataset is
-        # loaded 8 times into CPU RAM (64GB total), instantly crashing Kaggle.
         config.preload = False
         
         try:
@@ -237,13 +235,10 @@ def _train_worker(index_or_token=None, hf_token=None):
             num_cores = xr.world_size()
         except (ImportError, AttributeError):
             num_cores = xm.xrt_world_size()
-        # Recalculate grad_accum: effective = batch_size * num_cores * grad_accum
-        new_grad_accum = max(1, original_effective_batch // (config.batch_size * num_cores))
-        config.gradient_accumulation_steps = new_grad_accum
         if is_master:
             print(f"TPU detected ({num_cores} cores)")
             print(f"block_size: {config.block_size}  batch_size: {config.batch_size}  grad_accum: {config.gradient_accumulation_steps}  "
-                  f"(effective batch = {config.batch_size * num_cores * new_grad_accum})")
+                  f"(effective batch = {config.batch_size * num_cores * config.gradient_accumulation_steps} sequences = {config.batch_size * num_cores * config.block_size:,} tokens/step)")
             print(f"gradient_checkpointing: {config.gradient_checkpointing} (HBM memory optimized)")
             print(f"preload forced to False to prevent CPU OOM")
     elif torch.cuda.is_available():
