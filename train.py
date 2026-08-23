@@ -301,7 +301,10 @@ def _tpu_worker_wrapper(index, hf_token):
     # so the master process NEVER imports torch_xla and never locks the TPU.
     import os
     os.environ['PJRT_DEVICE'] = 'TPU'
-    # Use 8 cores since Kaggle TPU v3-8 has 8 cores
+    # CRITICAL: Tell PJRT this is a multi-process run, otherwise the C++ client segfaults!
+    os.environ['PJRT_LOCAL_PROCESS_COUNT'] = '8'
+    os.environ['PJRT_LOCAL_PROCESS_RANK'] = str(index)
+    
     _train_worker(index, hf_token)
 
 
