@@ -191,7 +191,7 @@ def _train_worker(index=None, hf_token=None):
         elif vram_gb >= 20:     # RTX 3090/4090 24GB
             new_batch = 4
         else:                   # T4 16GB / RTX 3060 etc.
-            new_batch = 2
+            new_batch = 1
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
 
