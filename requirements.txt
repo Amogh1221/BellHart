@@ -1,0 +1,16 @@
+# Install with:  pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu118
+# Use cu121 instead of cu118 if your CUDA version is 12.x
+torch>=2.0.0
+numpy>=1.24
+tiktoken>=0.5
+tokenizers>=0.15
+tqdm>=4.65
+tensorboard>=2.12
+datasets>=2.14
+requests>=2.31
+matplotlib
+zstandard
+safetensors
+bitsandbytes
+# TPU support (pre-installed on Kaggle TPU environments, skip on GPU)
+# torch_xla

@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+.venv/
+.env
+
+# PyTorch
+*.pt
+*.pth
+
+# Project specific
+data/
+checkpoints/
+runs/
+logs/
+samples/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Ignore wiki document
+docs/wiki.md
+
+# Archives
+*.zip
+scaleing_plan.md
+
+# Large files & UI
+models/
+*.safetensors
+*.png
+*.ipynb
+node_modules/
+.next/
