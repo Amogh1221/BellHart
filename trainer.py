@@ -16,6 +16,7 @@ Full-featured trainer with:
 """
 
 import os
+import contextlib
 import math
 import time
 import re
@@ -212,14 +213,19 @@ class Trainer:
         self.config = config
         self.tokenizer = tokenizer
         self.use_tpu = (config.device == "xla")
-        self.is_master = _is_master()
 
         # Set device
         if self.use_tpu:
             import torch_xla
             self.device = torch_xla.device()
+            self.is_master = _is_master()
+        elif is_ddp:
+            ddp_local_rank = int(os.environ['LOCAL_RANK'])
+            self.device = torch.device(f"cuda:{ddp_local_rank}")
+            self.is_master = (int(os.environ['RANK']) == 0)
         else:
             self.device = torch.device(config.device)
+            self.is_master = True
 
         os.makedirs("checkpoints", exist_ok=True)
         os.makedirs("samples", exist_ok=True)
@@ -583,18 +589,22 @@ class Trainer:
                 loss = loss / config.gradient_accumulation_steps
                 loss.backward()
             else:
-                with torch.amp.autocast(
-                    "cuda",
-                    dtype=_DTYPE_MAP.get(config.dtype, torch.float16),
-                    enabled=config.dtype != "float32",
-                ):
-                    logits, _ = model(x)
-                    loss = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        y.view(-1),
-                    )
-                    loss = loss / config.gradient_accumulation_steps
-                scaler.scale(loss).backward()
+                # DDP no_sync: skip all-reduce on all micro-steps except the last
+                is_last_micro = (self.micro_step + 1) % config.gradient_accumulation_steps == 0
+                ctx = contextlib.nullcontext() if (not self.is_ddp or is_last_micro) else model.no_sync()
+                with ctx:
+                    with torch.amp.autocast(
+                        "cuda",
+                        dtype=_DTYPE_MAP.get(config.dtype, torch.float16),
+                        enabled=config.dtype != "float32",
+                    ):
+                        logits, _ = model(x)
+                        loss = F.cross_entropy(
+                            logits.view(-1, logits.size(-1)),
+                            y.view(-1),
+                        )
+                        loss = loss / config.gradient_accumulation_steps
+                    scaler.scale(loss).backward()
 
             self.micro_step += 1
             if pbar:
