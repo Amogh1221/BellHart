@@ -210,8 +210,9 @@ def _train_worker(index_or_token=None, hf_token=None):
         config.dtype = "bfloat16"
         config.compile = False
         config.fused_adam = False
-        # TPU v3 has 15.75G HBM per core — batch_size=2 overflows by ~362MB.
-        # Halve batch_size to 1 and compensate with higher grad_accum.
+        config.gradient_checkpointing = 1
+        # TPU v3 has 15.75G HBM per core — batch_size=1 with gradient checkpointing
+        # drops activation memory to <1GB HBM, fitting easily on all TPU variants.
         original_effective_batch = config.batch_size * config.gradient_accumulation_steps
         config.batch_size = 1
         
@@ -232,6 +233,7 @@ def _train_worker(index_or_token=None, hf_token=None):
             print(f"TPU detected ({num_cores} cores)")
             print(f"batch_size: {config.batch_size}  grad_accum: {config.gradient_accumulation_steps}  "
                   f"(effective batch = {config.batch_size * num_cores * new_grad_accum})")
+            print(f"gradient_checkpointing: {config.gradient_checkpointing} (HBM memory optimized)")
             print(f"preload forced to False to prevent CPU OOM")
     elif torch.cuda.is_available():
         # ── Dynamic GPU VRAM auto-scaling ─────────────────────────────────
