@@ -19,9 +19,10 @@ class HFStreamingDataset(IterableDataset):
     Streams data from a HuggingFace dataset, tokenizes it on the fly, 
     and yields (x, y) chunks of block_size.
     """
-    def __init__(self, dataset_name: str, split: str, tokenizer, block_size: int, buffer_size: int = 10000, seed: int = 42):
+    def __init__(self, dataset_name: str, split: str, tokenizer, block_size: int, buffer_size: int = 10000, seed: int = 42, config_name: str = None):
         super().__init__()
         self.dataset_name = dataset_name
+        self.config_name = config_name
         self.split = split
         self.tokenizer = tokenizer
         self.block_size = block_size
@@ -35,9 +36,12 @@ class HFStreamingDataset(IterableDataset):
             # Different seed for each worker to ensure different shuffling
             seed += worker_info.id
 
-        log.info(f"Initializing stream for {self.dataset_name} ({self.split})")
+        log.info(f"Initializing stream for {self.dataset_name} ({self.config_name}) split: {self.split}")
         # Load streaming dataset
-        dataset = load_dataset(self.dataset_name, split=self.split, streaming=True)
+        if self.config_name:
+            dataset = load_dataset(self.dataset_name, self.config_name, split=self.split, streaming=True)
+        else:
+            dataset = load_dataset(self.dataset_name, split=self.split, streaming=True)
         # Shuffle the stream
         dataset = dataset.shuffle(buffer_size=self.buffer_size, seed=seed)
 
@@ -71,6 +75,7 @@ def create_streaming_dataloaders(
     num_workers: int = 2,
     pin_memory: bool = True,
     seed: int = 42,
+    dataset_config: str = None,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Build train and val DataLoaders using streaming.
@@ -81,7 +86,8 @@ def create_streaming_dataloaders(
         split="train",
         tokenizer=tokenizer,
         block_size=block_size,
-        seed=seed
+        seed=seed,
+        config_name=dataset_config
     )
     
     # Validation stream (different seed to sample different documents)
@@ -90,7 +96,8 @@ def create_streaming_dataloaders(
         split="train",
         tokenizer=tokenizer,
         block_size=block_size,
-        seed=seed + 9999
+        seed=seed + 9999,
+        config_name=dataset_config
     )
 
     train_loader = DataLoader(

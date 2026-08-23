@@ -203,6 +203,7 @@ def _train_worker(index=None, hf_token=None):
 
     train_loader, val_loader = create_streaming_dataloaders(
         dataset_name="openbmb/Ultra-FineWeb-L1",
+        dataset_config="CC-MAIN-2025-30",
         tokenizer=tokenizer,
         block_size=config.block_size,
         batch_size=config.batch_size,
