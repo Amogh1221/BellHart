@@ -3,19 +3,29 @@ import sys
 import json
 import torch
 import argparse
-
 import warnings
 import logging
 
 # ── Clean Terminal Setup ─────────────────────────────────────────────────────
-# Suppress python warnings (SyntaxWarning, UserWarning from XLA, etc)
+# Suppress all python warnings across all processes
 warnings.filterwarnings("ignore")
+warnings.simplefilter("ignore")
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=SyntaxWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Suppress PyTorch/XLA/TensorFlow C++ and distributed warnings
+# Suppress PyTorch/XLA/TensorFlow/Accelerate C++ and distributed logs
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
-os.environ["OMP_NUM_THREADS"] = "1"  # Silences the torchrun OMP warning
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["ACCELERATE_LOG_LEVEL"] = "ERROR"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+logging.getLogger("torch.distributed").setLevel(logging.ERROR)
 logging.getLogger("torch.distributed.elastic").setLevel(logging.ERROR)
+logging.getLogger("accelerate").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 # Clear Kaggle environment variables that conflict with PJRT
 os.environ.pop('TPU_PROCESS_ADDRESSES', None)
@@ -23,7 +33,6 @@ os.environ.pop('CLOUD_TPU_TASK_ID', None)
 os.environ['PYTHONFAULTHANDLER'] = '1'
 
 from huggingface_hub import login, hf_hub_download
-
 import importlib.util
 
 # ── TPU Detection ────────────────────────────────────────────────────────────
@@ -38,30 +47,41 @@ from trainer import Trainer
 from dataset import create_streaming_dataloaders
 
 
+def _is_proc_master() -> bool:
+    """Helper to check if this is the master process before full initialization."""
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+    return rank == 0
+
+
 def sync_huggingface(repo_id: str):
-    print("Syncing dataset and tokenizer from HuggingFace...")
+    if _is_proc_master():
+        print("Syncing dataset and tokenizer from HuggingFace...")
     os.makedirs("data", exist_ok=True)
     os.makedirs("tokenizer", exist_ok=True)
     os.makedirs("checkpoints", exist_ok=True)
     # Download dataset and tokenizer
-    # (Tokenizer is now checked into git as tokenizer.json)
-    print("Checking for existing checkpoints and logs...")
+    if _is_proc_master():
+        print("Checking for existing checkpoints and logs...")
     try:
         if not os.path.exists("checkpoints/latest.pt"):
             hf_hub_download(repo_id=repo_id, filename="checkpoints/latest.pt", repo_type="dataset", local_dir=".")
-            print("Successfully downloaded latest.pt")
+            if _is_proc_master():
+                print("Successfully downloaded latest.pt")
         else:
-            print("Found checkpoints/latest.pt locally, skipping download.")
-    except Exception as e:
-        print("No existing checkpoint found on HuggingFace.")
+            if _is_proc_master():
+                print("Found checkpoints/latest.pt locally, skipping download.")
+    except Exception:
+        if _is_proc_master():
+            print("No existing checkpoint found on HuggingFace.")
         
     try:
         hf_hub_download(repo_id=repo_id, filename="logs/training_log.txt", repo_type="dataset", local_dir=".")
-        print("Successfully downloaded training_log.txt")
-    except Exception as e:
-        print("No existing training log found on HuggingFace.")
+        if _is_proc_master():
+            print("Successfully downloaded training_log.txt")
+    except Exception:
+        if _is_proc_master():
+            print("No existing training log found on HuggingFace.")
         
-    # Disable HF progress bars for background uploads during training
     os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 
@@ -333,16 +353,18 @@ def main():
         if is_already_worker:
             _train_worker(index_or_token=hf_token)
         else:
-            print("=" * 56)
-            print("  BellHart — TPU Training Mode (8 cores)")
-            print("=" * 56)
+            if _is_proc_master():
+                print("=" * 56)
+                print("  BellHart — TPU Training Mode (8 cores)")
+                print("=" * 56)
             import torch_xla.distributed.xla_multiprocessing as xmp
             # In PJRT, nprocs=None automatically uses all 8 TPU cores
             xmp.spawn(_train_worker, args=(hf_token,), nprocs=None)
     else:
-        print("=" * 56)
-        print("  BellHart — GPU Training Mode")
-        print("=" * 56)
+        if _is_proc_master():
+            print("=" * 56)
+            print("  BellHart — GPU Training Mode")
+            print("=" * 56)
         
         is_ddp = int(os.environ.get('RANK', -1)) != -1
         if is_ddp:
