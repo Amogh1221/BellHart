@@ -268,10 +268,17 @@ class Trainer:
             "cuda", enabled=self.use_scaler
         ) if not self.use_tpu else None
 
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.train_iter = iter(self.train_loader)
-        self.val_iter = iter(self.val_loader)
+        if self.use_tpu:
+            import torch_xla.distributed.parallel_loader as pl
+            self.train_device_loader = pl.MpDeviceLoader(train_loader, self.device)
+            self.val_device_loader = pl.MpDeviceLoader(val_loader, self.device)
+            self.train_iter = iter(self.train_device_loader)
+            self.val_iter = iter(self.val_device_loader)
+        else:
+            self.train_loader = train_loader
+            self.val_loader = val_loader
+            self.train_iter = iter(self.train_loader)
+            self.val_iter = iter(self.val_loader)
 
         self.iter_num = 0
         self.best_val_loss = float("inf")
@@ -288,14 +295,23 @@ class Trainer:
             try:
                 x, y = next(self.train_iter)
             except StopIteration:
-                self.train_iter = iter(self.train_loader)
+                if self.use_tpu:
+                    self.train_iter = iter(self.train_device_loader)
+                else:
+                    self.train_iter = iter(self.train_loader)
                 x, y = next(self.train_iter)
         else:
             try:
                 x, y = next(self.val_iter)
             except StopIteration:
-                self.val_iter = iter(self.val_loader)
+                if self.use_tpu:
+                    self.val_iter = iter(self.val_device_loader)
+                else:
+                    self.val_iter = iter(self.val_loader)
                 x, y = next(self.val_iter)
+
+        if self.use_tpu:
+            return x, y
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
     @torch.no_grad()
