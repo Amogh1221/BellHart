@@ -211,6 +211,12 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x, present
 
+    def forward_checkpoint(self, x, rope_cos, rope_sin):
+        attn_out, _ = self.attn(self.ln_1(x), rope_cos, rope_sin, None)
+        x = x + attn_out
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # GPT Model
@@ -292,18 +298,12 @@ class GPT(nn.Module):
 
             ckpt = self.config.gradient_checkpointing
             if self.training and ckpt > 0 and (i % ckpt == 0):
-                def create_custom_forward(module):
-                    def custom_forward(hidden, cos, sin):
-                        out, _ = module(hidden, cos, sin, None)
-                        return out
-                    return custom_forward
-
                 if x.device.type == "xla":
                     import torch_xla.utils.checkpoint as xla_ckpt
-                    x = xla_ckpt.checkpoint(create_custom_forward(block), x, rope_cos, rope_sin)
+                    x = xla_ckpt.checkpoint(block.forward_checkpoint, x, rope_cos, rope_sin)
                 else:
                     x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block), x, rope_cos, rope_sin, use_reentrant=False
+                        block.forward_checkpoint, x, rope_cos, rope_sin, use_reentrant=True
                     )
                 present = None
             else:

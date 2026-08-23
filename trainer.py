@@ -662,8 +662,8 @@ class Trainer:
                 # Save loss before deleting to avoid UnboundLocalError
                 last_loss = loss.detach()
 
-                # Free huge activations (256MB) immediately before the next micro-step
-                del logits, loss
+                # Free activations and batch tensors immediately before next micro-step
+                del logits, loss, x, y
 
             self.micro_step += 1
             if pbar:
@@ -723,14 +723,13 @@ class Trainer:
                 self._tokens_processed += tokens_per_step
 
                 # Periodic host RAM cleanup to prevent OOM killer on cloud VMs
-                if self.micro_step % (config.gradient_accumulation_steps * 5) == 0:
-                    import gc
-                    gc.collect()
-                    try:
-                        import ctypes
-                        ctypes.CDLL("libc.so.6").malloc_trim(0)
-                    except Exception:
-                        pass
+                import gc
+                gc.collect()
+                try:
+                    import ctypes
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
 
                 # ── Per-step terminal + file log (master only) ───────────
                 if self.iter_num % config.log_interval == 0 and self.iter_num > 0:
