@@ -712,9 +712,7 @@ class Trainer:
                         f"Tokens: {self._tokens_processed:,}  "
                         f"loss={avg_loss:.4f}  lr={lr:.2e}  "
                         f"grad_norm={avg_gn:.3f}  "
-                        f"tok/s={tok_sec:,.0f}  "
-                        f"VRAM={vram_alloc:.1f}/{vram_total:.1f}GB  "
-                        f"ETA={eta_str}"
+                        f"tok/s={tok_sec:,.0f}"
                     )
                     if pbar:
                         pbar.write(log_str)
@@ -804,9 +802,7 @@ class Trainer:
                             f"  Learning Rate    : {lr:.2e}\n"
                             f"  Avg Grad Norm    : {avg_gn:.3f}\n"
                             f"  Tokens/sec       : {tok_sec:,.0f}\n"
-                            f"  VRAM             : {vram_alloc:.1f} / {vram_total:.1f} GB\n"
                             f"  Elapsed          : {_format_elapsed(elapsed)}\n"
-                            f"  ETA              : {_format_eta(eta)}\n"
                             f"{hr}"
                         )
                         if pbar:
