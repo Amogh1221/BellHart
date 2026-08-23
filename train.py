@@ -169,6 +169,8 @@ def _train_worker(index=None, hf_token=None):
             new_batch = 4
         else:                   # T4 16GB / RTX 3060 etc.
             new_batch = 2
+            config.use_8bit_optimizer = True
+            config.gradient_checkpointing = 1
 
         config.batch_size = new_batch
         config.gradient_accumulation_steps = max(1, original_effective_batch // new_batch)
