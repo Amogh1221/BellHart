@@ -33,12 +33,13 @@ class HFStreamingDataset(IterableDataset):
 
     def __iter__(self):
         import time
+        from collections import deque
         worker_info = torch.utils.data.get_worker_info()
         seed = self.seed
         if worker_info is not None:
             seed += worker_info.id
 
-        buffer = []
+        buffer = deque()
         chunk_size = self.block_size + 1
         retry_delay = 1.0
 
@@ -68,8 +69,7 @@ class HFStreamingDataset(IterableDataset):
 
                     # Yield chunks
                     while len(buffer) >= chunk_size:
-                        chunk = buffer[:chunk_size]
-                        buffer = buffer[chunk_size:]
+                        chunk = [buffer.popleft() for _ in range(chunk_size)]
                         
                         x = torch.tensor(chunk[:-1], dtype=torch.long)
                         y = torch.tensor(chunk[1:], dtype=torch.long)

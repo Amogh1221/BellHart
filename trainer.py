@@ -278,7 +278,7 @@ class Trainer:
             self.train_loader = train_loader
             self.val_loader = val_loader
             self.train_iter = iter(self.train_loader)
-            self.val_iter = iter(self.val_loader)
+            self.val_iter = None  # Lazy-initialize on demand during eval to save host RAM
 
         self.iter_num = 0
         self.best_val_loss = float("inf")
@@ -301,13 +301,12 @@ class Trainer:
                     self.train_iter = iter(self.train_loader)
                 x, y = next(self.train_iter)
         else:
+            if self.val_iter is None:
+                self.val_iter = iter(self.val_device_loader if self.use_tpu else self.val_loader)
             try:
                 x, y = next(self.val_iter)
             except StopIteration:
-                if self.use_tpu:
-                    self.val_iter = iter(self.val_device_loader)
-                else:
-                    self.val_iter = iter(self.val_loader)
+                self.val_iter = iter(self.val_device_loader if self.use_tpu else self.val_loader)
                 x, y = next(self.val_iter)
 
         if self.use_tpu:
@@ -344,6 +343,15 @@ class Trainer:
                     xm.mark_step()
             out[split] = losses.mean().item()
         self.model.train()
+        if not self.use_tpu:
+            self.val_iter = None
+            import gc
+            gc.collect()
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
         return out
 
     def save_checkpoint(self, path, step_num=None, max_ckpt=3, epoch_name=None):
@@ -483,6 +491,21 @@ class Trainer:
             threading.Thread(target=background_sync, daemon=True).start()
 
     def load_checkpoint(self, path):
+        # In DDP, stagger loading across ranks to avoid peak host CPU RAM spikes
+        if self.is_ddp and not self.use_tpu:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                world_size = int(os.environ.get("WORLD_SIZE", 1))
+                for r in range(world_size):
+                    if local_rank == r:
+                        self._load_ckpt_internal(path)
+                    dist.barrier()
+                return
+
+        self._load_ckpt_internal(path)
+
+    def _load_ckpt_internal(self, path):
         # Load on CPU first to avoid a GPU memory spike (checkpoint + model +
         # EMA + optimizer state would otherwise all be materialised on-device).
         # load_state_dict copies to the device incrementally.
@@ -505,8 +528,15 @@ class Trainer:
         if self.use_scaler and self.scaler is not None and "scaler" in ckpt:
             self.scaler.load_state_dict(ckpt["scaler"])
         del ckpt
+        import gc
+        gc.collect()
         if not self.use_tpu and torch.cuda.is_available():
             torch.cuda.empty_cache()
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
         if self.is_master:
             print(f"Loaded checkpoint from {path} (iteration {self.iter_num}, best val loss: {self.best_val_loss:.4f})")
 
@@ -678,13 +708,6 @@ class Trainer:
                 else:
                     optimizer.zero_grad(set_to_none=True)
 
-                if self.use_tpu:
-                    # On TPU, do not accumulate to prevent memory leaks, just keep the latest
-                    self._grad_norm_sum = grad_norm
-                else:
-                    self._grad_norm_sum += grad_norm
-                self._grad_norm_count += 1
-
                 if self.ema is not None:
                     self.ema.update()
 
@@ -698,6 +721,16 @@ class Trainer:
                     self._grad_norm_sum += grad_norm
                 self._grad_norm_count += 1
                 self._tokens_processed += tokens_per_step
+
+                # Periodic host RAM cleanup to prevent OOM killer on cloud VMs
+                if self.micro_step % (config.gradient_accumulation_steps * 5) == 0:
+                    import gc
+                    gc.collect()
+                    try:
+                        import ctypes
+                        ctypes.CDLL("libc.so.6").malloc_trim(0)
+                    except Exception:
+                        pass
 
                 # ── Per-step terminal + file log (master only) ───────────
                 if self.iter_num % config.log_interval == 0 and self.iter_num > 0:
