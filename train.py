@@ -192,7 +192,7 @@ def _train_worker(index=None, hf_token=None):
             new_batch = 4
         else:                   # T4 16GB / RTX 3060 etc.
             new_batch = 1
-            config.use_8bit_optimizer = True
+            config.use_8bit_optimizer = False
             config.gradient_checkpointing = 1
 
         # Scale eval_iters inversely so validation takes the same time
