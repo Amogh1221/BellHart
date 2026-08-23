@@ -262,21 +262,29 @@ def _train_worker(index_or_token=None, hf_token=None):
         else:
             original_effective_batch = config.batch_size * config.gradient_accumulation_steps
 
-        # Scale batch_size based on available VRAM
+        # Prevent CUDA memory fragmentation
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+        # Scale batch_size and optimizations based on available VRAM
         if vram_gb >= 70:       # H100 80GB / A100 80GB
-            new_batch = 16
-            config.compile = True
+            new_batch = 8
+            config.compile = False
+            config.gradient_checkpointing = 1
             config.save_interval = 400
         elif vram_gb >= 35:     # A100 40GB
-            new_batch = 8
-            config.compile = True
-            config.save_interval = 200
-        elif vram_gb >= 20:     # RTX 3090/4090 24GB
             new_batch = 4
-            config.compile = True
+            config.compile = False
+            config.gradient_checkpointing = 1
+            config.save_interval = 200
+        elif vram_gb >= 20:     # NVIDIA L4 / RTX 3090 / 4090 (24GB)
+            new_batch = 2
+            config.compile = False
+            config.use_8bit_optimizer = True
+            config.gradient_checkpointing = 1
             config.save_interval = 100
         else:                   # T4 16GB / RTX 3060 etc.
             new_batch = 1
+            config.compile = False
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
 
