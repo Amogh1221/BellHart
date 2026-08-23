@@ -598,6 +598,9 @@ class Trainer:
                 loss.backward()
                 last_loss = loss.detach()
                 del logits, loss
+                # Keep graph bounded to 1 microstep to prevent CPU RAM OOM during compilation
+                if config.gradient_accumulation_steps > 1 and (self.micro_step + 1) % config.gradient_accumulation_steps != 0:
+                    xm.mark_step()
             else:
                 # DDP no_sync: skip all-reduce on all micro-steps except the last
                 is_last_micro = (self.micro_step + 1) % config.gradient_accumulation_steps == 0
@@ -626,13 +629,6 @@ class Trainer:
                 micro = self.micro_step % config.gradient_accumulation_steps
                 if micro == 0: micro = config.gradient_accumulation_steps
                 pbar.set_description(f"Training (Micro {micro}/{config.gradient_accumulation_steps})")
-
-            # ── Prevent CPU RAM OOM during compilation ──────────────────
-            # Unrolling 10 micro-steps into a single XLA graph consumes >30GB of CPU RAM
-            # during compilation on Kaggle, triggering the OOM killer. We slice the graph
-            # into chunks of 5 micro-steps max by marking steps periodically.
-            if self.use_tpu and self.micro_step % 5 == 0 and self.micro_step % config.gradient_accumulation_steps != 0:
-                xm.mark_step()
 
             if self.micro_step % config.gradient_accumulation_steps == 0:
                 # ── Gradient clipping + norm tracking ────────────────────
