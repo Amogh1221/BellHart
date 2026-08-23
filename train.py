@@ -102,23 +102,33 @@ def _train_worker(index=None, hf_token=None):
     is_ddp = int(os.environ.get('RANK', -1)) != -1
     
     if USE_TPU:
-        try:
-            import torch_xla.runtime as xr
-            is_master = xr.global_ordinal() == 0
-            seed_offset = xr.global_ordinal()
-            global_rank = xr.global_ordinal()
-            world_size = xr.world_size()
-        except (ImportError, AttributeError):
-            import torch_xla.core.xla_model as xm
-            is_master = xm.is_master_ordinal(local=False)
-            seed_offset = xm.get_ordinal()
-            global_rank = xm.get_ordinal()
-            world_size = xm.xrt_world_size()
+        import torch_xla.core.xla_model as xm
+        if is_ddp:
+            import torch.distributed as dist
+            import torch_xla.distributed.xla_backend
+            if not dist.is_initialized():
+                dist.init_process_group("xla", init_method="xla://")
+            global_rank = int(os.environ.get('RANK', 0))
+            world_size = int(os.environ.get('WORLD_SIZE', 1))
+            is_master = global_rank == 0
+            seed_offset = global_rank
+        else:
+            try:
+                import torch_xla.runtime as xr
+                is_master = xr.global_ordinal() == 0
+                seed_offset = xr.global_ordinal()
+                global_rank = xr.global_ordinal()
+                world_size = xr.world_size()
+            except (ImportError, AttributeError):
+                is_master = xm.is_master_ordinal(local=False)
+                seed_offset = xm.get_ordinal()
+                global_rank = xm.get_ordinal()
+                world_size = xm.xrt_world_size()
         # Set BF16 natively on TPU
         os.environ["XLA_USE_BF16"] = "1"
         
         ddp_rank = global_rank
-        ddp_local_rank = global_rank % 8 # typically max 8 per node
+        ddp_local_rank = global_rank % 8
         ddp_world_size = world_size
     elif is_ddp:
         import torch.distributed as dist
@@ -158,13 +168,9 @@ def _train_worker(index=None, hf_token=None):
 
     repo_id = config.hf_repo
 
-    # Only master downloads data (avoid 8 concurrent downloads)
+    # Only master downloads data (avoid concurrent downloads)
     if is_master:
         sync_huggingface(repo_id)
-    
-    # On TPU, wait for master to finish downloading
-    if USE_TPU:
-        xm.rendezvous("data_download")
 
 
     # ── Auto-detect device and adjust config ─────────────────────────────

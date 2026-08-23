@@ -114,8 +114,9 @@ def _is_master() -> bool:
             import torch_xla.runtime as xr
             return xr.global_ordinal() == 0
         except (ImportError, AttributeError):
+            import torch_xla.core.xla_model as xm
             return xm.is_master_ordinal(local=False)
-    return True
+    return int(os.environ.get('RANK', 0)) == 0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
