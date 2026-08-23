@@ -19,7 +19,7 @@ class HFStreamingDataset(IterableDataset):
     Streams data from a HuggingFace dataset, tokenizes it on the fly, 
     and yields (x, y) chunks of block_size.
     """
-    def __init__(self, dataset_name: str, split: str, tokenizer, block_size: int, buffer_size: int = 100, seed: int = 42, config_name: str = None):
+    def __init__(self, dataset_name: str, split: str, tokenizer, block_size: int, buffer_size: int = 100, seed: int = 42, config_name: str = None, rank: int = 0, world_size: int = 1):
         super().__init__()
         self.dataset_name = dataset_name
         self.config_name = config_name
@@ -28,6 +28,8 @@ class HFStreamingDataset(IterableDataset):
         self.block_size = block_size
         self.buffer_size = buffer_size
         self.seed = seed
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -42,6 +44,11 @@ class HFStreamingDataset(IterableDataset):
             dataset = load_dataset(self.dataset_name, self.config_name, split=self.split, streaming=True)
         else:
             dataset = load_dataset(self.dataset_name, split=self.split, streaming=True)
+            
+        # VERY IMPORTANT: Shard the dataset across GPUs/TPUs so they don't train on the same data
+        if self.world_size > 1:
+            dataset = dataset.shard(num_shards=self.world_size, index=self.rank)
+            
         # Shuffle the stream
         dataset = dataset.shuffle(buffer_size=self.buffer_size, seed=seed)
 
@@ -76,6 +83,8 @@ def create_streaming_dataloaders(
     pin_memory: bool = True,
     seed: int = 42,
     dataset_config: str = None,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Build train and val DataLoaders using streaming.
@@ -87,7 +96,9 @@ def create_streaming_dataloaders(
         tokenizer=tokenizer,
         block_size=block_size,
         seed=seed,
-        config_name=dataset_config
+        config_name=dataset_config,
+        rank=rank,
+        world_size=world_size
     )
     
     # Validation stream (different seed to sample different documents)
@@ -97,7 +108,9 @@ def create_streaming_dataloaders(
         tokenizer=tokenizer,
         block_size=block_size,
         seed=seed + 9999,
-        config_name=dataset_config
+        config_name=dataset_config,
+        rank=rank,
+        world_size=world_size
     )
 
     train_loader = DataLoader(
@@ -111,7 +124,7 @@ def create_streaming_dataloaders(
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        num_workers=num_workers, # Use the same worker count as train
+        num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=True,
     )

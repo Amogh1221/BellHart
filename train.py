@@ -100,21 +100,29 @@ def _train_worker(index=None, hf_token=None):
         torch.cuda.set_device(ddp_local_rank)
         is_master = ddp_rank == 0
         seed_offset = ddp_rank
+        global_rank = ddp_rank
+        world_size = ddp_world_size
     else:
         ddp_rank = 0
         ddp_local_rank = 0
         ddp_world_size = 1
         is_master = True
         seed_offset = 0
+        global_rank = 0
+        world_size = 1
 
     if USE_TPU:
         try:
             import torch_xla.runtime as xr
             is_master = xr.global_ordinal() == 0
             seed_offset = xr.global_ordinal()
+            global_rank = xr.global_ordinal()
+            world_size = xr.world_size()
         except (ImportError, AttributeError):
             is_master = xm.is_master_ordinal(local=False)
             seed_offset = xm.get_ordinal()
+            global_rank = xm.get_ordinal()
+            world_size = xm.xrt_world_size()
         # Set BF16 natively on TPU
         os.environ["XLA_USE_BF16"] = "1"
 
@@ -250,6 +258,8 @@ def _train_worker(index=None, hf_token=None):
         batch_size=config.batch_size,
         num_workers=0,
         seed=42 + seed_offset,
+        rank=global_rank,
+        world_size=world_size,
     )
 
     trainer = Trainer(config, tokenizer, train_loader, val_loader, is_ddp=is_ddp)
