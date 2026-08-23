@@ -4,6 +4,19 @@ import json
 import torch
 import argparse
 
+import warnings
+import logging
+
+# ── Clean Terminal Setup ─────────────────────────────────────────────────────
+# Suppress python warnings (SyntaxWarning, UserWarning from XLA, etc)
+warnings.filterwarnings("ignore")
+
+# Suppress PyTorch/XLA/TensorFlow C++ and distributed warnings
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
+os.environ["OMP_NUM_THREADS"] = "1"  # Silences the torchrun OMP warning
+logging.getLogger("torch.distributed.elastic").setLevel(logging.ERROR)
+
 # Clear Kaggle environment variables that conflict with PJRT
 os.environ.pop('TPU_PROCESS_ADDRESSES', None)
 os.environ.pop('CLOUD_TPU_TASK_ID', None)
