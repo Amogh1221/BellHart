@@ -19,7 +19,7 @@ class HFStreamingDataset(IterableDataset):
     Streams data from a HuggingFace dataset, tokenizes it on the fly, 
     and yields (x, y) chunks of block_size.
     """
-    def __init__(self, dataset_name: str, split: str, tokenizer, block_size: int, buffer_size: int = 1000, seed: int = 42, config_name: str = None):
+    def __init__(self, dataset_name: str, split: str, tokenizer, block_size: int, buffer_size: int = 100, seed: int = 42, config_name: str = None):
         super().__init__()
         self.dataset_name = dataset_name
         self.config_name = config_name
