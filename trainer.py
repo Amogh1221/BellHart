@@ -144,9 +144,9 @@ class FileLogger:
         if flush:
             self.file.flush()
 
-    def log_step(self, step, total, loss, lr, grad_norm, tok_sec, vram_alloc, eta_str):
+    def log_step(self, step, total, loss, lr, grad_norm, tok_sec, vram_alloc, eta_str, tokens=0):
         line = (
-            f"[{self._ts()}] STEP {step:>7d}/{total} | "
+            f"[{self._ts()}] STEP {step:>7d}/{total} | Tokens: {tokens:,} | "
             f"loss={loss:.4f} | lr={lr:.2e} | grad_norm={grad_norm:.3f} | "
             f"tok/s={tok_sec:,.0f} | VRAM={vram_alloc:.1f}GB | ETA={eta_str}"
         )
@@ -154,7 +154,7 @@ class FileLogger:
 
     def log_eval(self, step, total, train_loss, val_loss, best_val, ppl,
                  ema_val, lr, avg_grad_norm, tok_sec, vram_alloc, vram_total,
-                 elapsed_str, eta_str):
+                 elapsed_str, eta_str, tokens=0):
         pct = step / total * 100 if total > 0 else 0
         delta_val = val_loss - best_val if best_val < float("inf") and val_loss != best_val else 0.0
         delta_str = f"Δ: {delta_val:+.4f}" if delta_val != 0 else "NEW BEST"
@@ -164,8 +164,9 @@ class FileLogger:
 {hr}
   EVALUATION @ Step {step} / {total}   ({pct:.1f}%)
 {hr}
-  Train Loss     : {train_loss:.4f}
-  Val Loss       : {val_loss:.4f}  (best: {best_val:.4f}  {delta_str})
+  Tokens Processed : {tokens:,}
+  Train Loss       : {train_loss:.4f}
+  Val Loss         : {val_loss:.4f}  (best: {best_val:.4f}  {delta_str})
   Perplexity     : {ppl:.2f}
   EMA Val Loss   : {f'{ema_val:.4f}' if ema_val is not None else 'N/A'}
   Learning Rate  : {lr:.2e}
@@ -348,6 +349,21 @@ class Trainer:
             if is_best:
                 torch.save(ckpt, "checkpoints/best.pt")
 
+        # Local cleanup
+        if step_num is not None:
+            try:
+                import re
+                ckpt_dir = os.path.dirname(path)
+                files = os.listdir(ckpt_dir)
+                ckpt_files = [f for f in files if re.match(r"checkpoint-\d+\.pt", f)]
+                ckpt_files.sort(key=lambda x: int(re.search(r"checkpoint-(\d+)\.pt", x).group(1)))
+                if len(ckpt_files) > max_ckpt:
+                    to_delete = ckpt_files[:-max_ckpt]
+                    for f in to_delete:
+                        os.remove(os.path.join(ckpt_dir, f))
+            except Exception as e:
+                pass
+
         # Background HuggingFace sync
         hf_token = os.environ.get("HF_TOKEN")
         if hf_token:
@@ -374,23 +390,10 @@ class Trainer:
                             upload_ops = []
                             delete_ops = []
                             
-                            # Add latest checkpoint operation
-                            upload_ops.append(CommitOperationAdd(
-                                path_in_repo="checkpoints/latest.pt",
-                                path_or_fileobj=sync_path
-                            ))
-                            
                             # Add historical copy operation
                             if step_num is not None:
                                 upload_ops.append(CommitOperationAdd(
-                                    path_in_repo=f"checkpoints/checkpoint-{step_num:05d}.pt",
-                                    path_or_fileobj=sync_path
-                                ))
-                                
-                            # Add epoch checkpoint operation
-                            if epoch_name is not None:
-                                upload_ops.append(CommitOperationAdd(
-                                    path_in_repo=f"checkpoints/{epoch_name}.pt",
+                                    path_in_repo=f"checkpoints/checkpoint-{step_num:06d}.pt",
                                     path_or_fileobj=sync_path
                                 ))
                                 
@@ -688,6 +691,7 @@ class Trainer:
                     # Terminal
                     log_str = (
                         f"[Step {self.iter_num:>7d}/{config.max_iters}]  "
+                        f"Tokens: {self._tokens_processed:,}  "
                         f"loss={avg_loss:.4f}  lr={lr:.2e}  "
                         f"grad_norm={avg_gn:.3f}  "
                         f"tok/s={tok_sec:,.0f}  "
@@ -771,19 +775,20 @@ class Trainer:
                             f"\n{hr}\n"
                             f"  EVALUATION @ Step {self.iter_num} / {config.max_iters}   ({pct:.1f}%)\n"
                             f"{hr}\n"
-                            f"  Train Loss     : {train_loss:.4f}\n"
-                            f"  Val Loss       : {val_loss:.4f}  (best: {self.best_val_loss:.4f}  {delta_str})\n"
-                            f"  Perplexity     : {ppl:.2f}\n"
+                            f"  Tokens Processed : {self._tokens_processed:,}\n"
+                            f"  Train Loss       : {train_loss:.4f}\n"
+                            f"  Val Loss         : {val_loss:.4f}  (best: {self.best_val_loss:.4f}  {delta_str})\n"
+                            f"  Perplexity       : {ppl:.2f}\n"
                         )
                         if ema_val is not None:
-                            eval_str += f"  EMA Val Loss   : {ema_val:.4f}\n"
+                            eval_str += f"  EMA Val Loss     : {ema_val:.4f}\n"
                         eval_str += (
-                            f"  Learning Rate  : {lr:.2e}\n"
-                            f"  Avg Grad Norm  : {avg_gn:.3f}\n"
-                            f"  Tokens/sec     : {tok_sec:,.0f}\n"
-                            f"  VRAM           : {vram_alloc:.1f} / {vram_total:.1f} GB\n"
-                            f"  Elapsed        : {_format_elapsed(elapsed)}\n"
-                            f"  ETA            : {_format_eta(eta)}\n"
+                            f"  Learning Rate    : {lr:.2e}\n"
+                            f"  Avg Grad Norm    : {avg_gn:.3f}\n"
+                            f"  Tokens/sec       : {tok_sec:,.0f}\n"
+                            f"  VRAM             : {vram_alloc:.1f} / {vram_total:.1f} GB\n"
+                            f"  Elapsed          : {_format_elapsed(elapsed)}\n"
+                            f"  ETA              : {_format_eta(eta)}\n"
                             f"{hr}"
                         )
                         if pbar:
@@ -808,6 +813,7 @@ class Trainer:
                                 vram_total=vram_total,
                                 elapsed_str=_format_elapsed(elapsed),
                                 eta_str=_format_eta(eta),
+                                tokens=self._tokens_processed,
                             )
 
                         # Update tqdm postfix
@@ -820,11 +826,12 @@ class Trainer:
                             })
 
                     # Save checkpoint (master only — handled inside save_checkpoint)
+                    ckpt_path = f"checkpoints/checkpoint-{self.iter_num + 1:06d}.pt"
                     if is_best:
                         self.best_val_loss = val_loss
-                        self.save_checkpoint("checkpoints/latest.pt", is_best=True, step_num=self.iter_num + 1)
+                        self.save_checkpoint(ckpt_path, is_best=True, step_num=self.iter_num + 1)
                     else:
-                        self.save_checkpoint("checkpoints/latest.pt", step_num=self.iter_num + 1)
+                        self.save_checkpoint(ckpt_path, step_num=self.iter_num + 1)
 
                     # Defrag memory after eval's memory spike
                     if not self.use_tpu and torch.cuda.is_available():
@@ -834,15 +841,8 @@ class Trainer:
                     self.generate_samples()
 
                 if self.iter_num % config.save_interval == 0 and self.iter_num > 0 and self._steps_taken_since_resume > 0:
-                    self.save_checkpoint("checkpoints/latest.pt", step_num=self.iter_num + 1)
-                    
-                # ── Epoch Checkpoints ────────────────────────────────────
-                current_epoch = int((self.iter_num * tokens_per_step) / max(self.train_len, 1))
-                next_epoch = int(((self.iter_num + 1) * tokens_per_step) / max(self.train_len, 1))
-                
-                if next_epoch > current_epoch and next_epoch in [1, 2]:
-                    epoch_name = f"epoch-{next_epoch}"
-                    self.save_checkpoint(f"checkpoints/{epoch_name}.pt", epoch_name=epoch_name)
+                    ckpt_path = f"checkpoints/checkpoint-{self.iter_num + 1:06d}.pt"
+                    self.save_checkpoint(ckpt_path, step_num=self.iter_num + 1)
 
                 self.iter_num += 1
                 self._steps_taken_since_resume += 1

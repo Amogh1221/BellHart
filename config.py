@@ -27,18 +27,18 @@ class GPTConfig:
     # ── Training ────────────────────────────────────────────────────────
     batch_size: int = 1
     gradient_accumulation_steps: int = 40
-    max_iters: int = 35000
+    max_iters: int = 100000
     learning_rate: float = 3e-4
     weight_decay: float = 0.1
     beta1: float = 0.95
     beta2: float = 0.95
     warmup_iters: int = 3000
-    lr_decay_iters: int = 35000
+    lr_decay_iters: int = 100000
     min_lr: float = 3e-5
-    eval_interval: int = 1000
+    eval_interval: int = 200
     eval_iters: int = 200
-    log_interval: int = 10
-    save_interval: int = 1000
+    log_interval: int = 1
+    save_interval: int = 20
     gen_interval: int = 5000
     max_new_tokens_gen: int = 256
     num_generations: int = 3
