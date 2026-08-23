@@ -99,7 +99,27 @@ def _train_worker(index=None, hf_token=None):
     Core training function. Runs once on GPU, or is spawned per-core on TPU.
     """
     is_ddp = int(os.environ.get('RANK', -1)) != -1
-    if is_ddp:
+    
+    if USE_TPU:
+        try:
+            import torch_xla.runtime as xr
+            is_master = xr.global_ordinal() == 0
+            seed_offset = xr.global_ordinal()
+            global_rank = xr.global_ordinal()
+            world_size = xr.world_size()
+        except (ImportError, AttributeError):
+            import torch_xla.core.xla_model as xm
+            is_master = xm.is_master_ordinal(local=False)
+            seed_offset = xm.get_ordinal()
+            global_rank = xm.get_ordinal()
+            world_size = xm.xrt_world_size()
+        # Set BF16 natively on TPU
+        os.environ["XLA_USE_BF16"] = "1"
+        
+        ddp_rank = global_rank
+        ddp_local_rank = global_rank % 8 # typically max 8 per node
+        ddp_world_size = world_size
+    elif is_ddp:
         import torch.distributed as dist
         dist.init_process_group("nccl")
         ddp_rank = int(os.environ['RANK'])
@@ -118,21 +138,6 @@ def _train_worker(index=None, hf_token=None):
         seed_offset = 0
         global_rank = 0
         world_size = 1
-
-    if USE_TPU:
-        try:
-            import torch_xla.runtime as xr
-            is_master = xr.global_ordinal() == 0
-            seed_offset = xr.global_ordinal()
-            global_rank = xr.global_ordinal()
-            world_size = xr.world_size()
-        except (ImportError, AttributeError):
-            is_master = xm.is_master_ordinal(local=False)
-            seed_offset = xm.get_ordinal()
-            global_rank = xm.get_ordinal()
-            world_size = xm.xrt_world_size()
-        # Set BF16 natively on TPU
-        os.environ["XLA_USE_BF16"] = "1"
 
     if hf_token:
         login(token=hf_token)
@@ -295,19 +300,26 @@ def main():
     parser.add_argument("--hf_token", type=str, required=True, help="HuggingFace WRITE Token")
     args = parser.parse_args()
 
+    is_ddp = int(os.environ.get('RANK', -1)) != -1
+
     if USE_TPU:
-        print("=" * 56)
-        print("  BellHart — TPU Training Mode")
-        print("=" * 56)
-        import torch_xla.distributed.xla_multiprocessing as xmp
-        # xmp.spawn launches _train_worker on all available TPU cores (1, 4, or 8)
-        xmp.spawn(_train_worker, args=(args.hf_token,), nprocs=None, start_method="fork")
+        if is_ddp:
+            print("=" * 56)
+            print("  BellHart — TPU Training Mode (via torchrun)")
+            print("=" * 56)
+            _train_worker(index=None, hf_token=args.hf_token)
+        else:
+            print("=" * 56)
+            print("  BellHart — TPU Training Mode")
+            print("=" * 56)
+            import torch_xla.distributed.xla_multiprocessing as xmp
+            # xmp.spawn launches _train_worker on all available TPU cores (1, 4, or 8)
+            xmp.spawn(_train_worker, args=(args.hf_token,), nprocs=None, start_method="fork")
     else:
         print("=" * 56)
         print("  BellHart — GPU Training Mode")
         print("=" * 56)
         
-        is_ddp = int(os.environ.get('RANK', -1)) != -1
         if is_ddp:
             if int(os.environ.get('RANK', 0)) == 0:
                 print(f"Authenticating with HuggingFace (DDP Master)...")
@@ -316,7 +328,7 @@ def main():
             
         _train_worker(index=None, hf_token=args.hf_token)
 
-    if int(os.environ.get('RANK', -1)) != -1:
+    if is_ddp and not USE_TPU:
         import torch.distributed as dist
         dist.destroy_process_group()
 
