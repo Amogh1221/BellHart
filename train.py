@@ -296,23 +296,6 @@ def _train_worker(index=None, hf_token=None):
         sys.exit(0)
 
 
-def _tpu_worker_wrapper(index, hf_token):
-    # We set PJRT variables dynamically inside the spawned process
-    # so the master process NEVER imports torch_xla and never locks the TPU.
-    import os
-    os.environ['PJRT_DEVICE'] = 'TPU'
-    # CRITICAL: Tell PJRT this is a multi-process run, otherwise the C++ client segfaults!
-    os.environ['PJRT_LOCAL_PROCESS_COUNT'] = '8'
-    os.environ['PJRT_LOCAL_PROCESS_RANK'] = str(index)
-    os.environ['WORLD_SIZE'] = '8'
-    os.environ['RANK'] = str(index)
-    # PJRT also requires a master address for its internal GRPC rendezvous
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    
-    _train_worker(index, hf_token)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hf_token", type=str, required=True, help="HuggingFace WRITE Token")
@@ -321,19 +304,18 @@ def main():
     is_ddp = int(os.environ.get('RANK', -1)) != -1
 
     if USE_TPU:
+        os.environ["PJRT_DEVICE"] = "TPU"
         if is_ddp:
             print("=" * 56)
-            print("  BellHart — TPU Training Mode (via torchrun)")
+            print("  BellHart — TPU Training Mode (Distributed)")
             print("=" * 56)
             _train_worker(index=None, hf_token=args.hf_token)
         else:
             print("=" * 56)
-            print("  BellHart — TPU Training Mode")
+            print("  BellHart — TPU Training Mode (xmp.spawn 8 cores)")
             print("=" * 56)
-            import torch.multiprocessing as mp
-            # Spawn 8 fresh Python processes. Because the master process hasn't
-            # imported torch_xla, the TPU hardware is completely free and untouched.
-            mp.spawn(_tpu_worker_wrapper, args=(args.hf_token,), nprocs=8, start_method="spawn")
+            import torch_xla.distributed.xla_multiprocessing as xmp
+            xmp.spawn(_train_worker, args=(args.hf_token,), nprocs=8)
     else:
         print("=" * 56)
         print("  BellHart — GPU Training Mode")
