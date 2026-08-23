@@ -331,10 +331,7 @@ class Trainer:
         return out
 
     def save_checkpoint(self, path, step_num=None, max_ckpt=3, epoch_name=None):
-        if not self.is_master:
-            return
-
-        model_state = self.model.module.state_dict() if self.is_ddp else self.model.state_dict()
+        model_state = self.model.module.state_dict() if hasattr(self.model, "module") else self.model.state_dict()
         ckpt = {
             "model_state_dict": model_state,
             "optimizer_state_dict": self.optimizer.state_dict(),
@@ -342,15 +339,20 @@ class Trainer:
             "best_val_loss": self.best_val_loss,
             "config": self.config,
         }
-        if self.ema is not None:
+        if getattr(self, "ema", None) is not None:
             ckpt["ema"] = self.ema.state_dict()
-        if self.use_scaler and self.scaler is not None:
+        if getattr(self, "use_scaler", False) and getattr(self, "scaler", None) is not None:
             ckpt["scaler"] = self.scaler.state_dict()
 
-        if self.use_tpu:
-            xm.save(ckpt, path)
+        if getattr(self, "use_tpu", False):
+            import torch_xla.core.xla_model as xm
+            xm.save(ckpt, path, master_only=True, global_master=True)
         else:
-            torch.save(ckpt, path)
+            if self.is_master:
+                torch.save(ckpt, path)
+
+        if not self.is_master:
+            return
 
         # Local cleanup
         if step_num is not None:
