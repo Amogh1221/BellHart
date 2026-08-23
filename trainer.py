@@ -622,14 +622,17 @@ class Trainer:
                 # ── Gradient clipping + norm tracking ────────────────────
                 grad_norm = 0.0
                 if self.use_tpu:
-                    # TPU: clip gradients directly (no scaler)
-                    # IMPORTANT: avoid .item() here — it forces XLA sync
+                    # TPU: 1. Synchronize gradients across all 8 cores
+                    xm.reduce_gradients(optimizer)
+                    # 2. Clip gradients on synchronized grads
                     if config.grad_clip > 0.0:
-                        xm.reduce_gradients(optimizer)
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             model.parameters(), config.grad_clip
                         )
-                    xm.optimizer_step(optimizer)
+                    # 3. Step optimizer on synchronized gradients
+                    optimizer.step()
+                    # 4. Mark step boundary
+                    xm.mark_step()
                 else:
                     if config.grad_clip > 0.0:
                         scaler.unscale_(optimizer)
