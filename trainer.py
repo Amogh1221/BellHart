@@ -37,13 +37,10 @@ from config import GPTConfig
 from model import GPT, EMA
 
 
+import importlib.util
+
 # ── TPU Detection ────────────────────────────────────────────────────────────
-USE_TPU = False
-try:
-    import torch_xla.core.xla_model as xm
-    USE_TPU = True
-except ImportError:
-    pass
+USE_TPU = importlib.util.find_spec("torch_xla") is not None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Dtype mapping
@@ -302,6 +299,8 @@ class Trainer:
 
     @torch.no_grad()
     def estimate_loss(self):
+        if getattr(self, "use_tpu", False):
+            import torch_xla.core.xla_model as xm
         out = {}
         self.model.eval()
         for split in ("train", "val"):
@@ -538,6 +537,9 @@ class Trainer:
         model = self.model
         optimizer = self.optimizer
         scaler = self.scaler
+
+        if getattr(self, "use_tpu", False):
+            import torch_xla.core.xla_model as xm
 
         # ── Log config at training start ─────────────────────────────────
         if self.iter_num == 0 and self.is_master and self.flog:

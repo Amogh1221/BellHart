@@ -23,14 +23,10 @@ os.environ.pop('CLOUD_TPU_TASK_ID', None)
 
 from huggingface_hub import login, hf_hub_download
 
+import importlib.util
+
 # ── TPU Detection ────────────────────────────────────────────────────────────
-USE_TPU = False
-try:
-    import torch_xla.core.xla_model as xm
-    import torch_xla.distributed.xla_multiprocessing as xmp
-    USE_TPU = True
-except ImportError:
-    pass
+USE_TPU = importlib.util.find_spec("torch_xla") is not None
 
 if not USE_TPU:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
@@ -303,8 +299,9 @@ def main():
         print("=" * 56)
         print("  BellHart — TPU Training Mode")
         print("=" * 56)
+        import torch_xla.distributed.xla_multiprocessing as xmp
         # xmp.spawn launches _train_worker on all available TPU cores (1, 4, or 8)
-        xmp.spawn(_train_worker, args=(args.hf_token,), nprocs=None)
+        xmp.spawn(_train_worker, args=(args.hf_token,), nprocs=None, start_method="fork")
     else:
         print("=" * 56)
         print("  BellHart — GPU Training Mode")
