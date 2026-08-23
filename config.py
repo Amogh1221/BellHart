@@ -46,7 +46,7 @@ class GPTConfig:
     # ── System ──────────────────────────────────────────────────────────
     device: str = "cuda"
     dtype: str = "bfloat16"
-    compile: bool = True
+    compile: bool = False       # Disabled: Kaggle 30GB RAM can't handle 2x DDP compile
     fused_adam: bool = True
     tf32: bool = True
     use_8bit_optimizer: bool = False   # Use bitsandbytes PagedAdamW8bit (Linux/CUDA only)

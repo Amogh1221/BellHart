@@ -59,3 +59,5 @@ models/
 *.ipynb
 node_modules/
 .next/
+
+q.txt
