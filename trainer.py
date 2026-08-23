@@ -663,74 +663,63 @@ class Trainer:
                     self.ema.update()
 
                 if self.use_tpu:
-                    # On TPU, do not accumulate running loss to avoid graph history memory leaks.
-                    # Just save the detached tensor from the last step.
-                    step_loss = last_loss * config.gradient_accumulation_steps
-                    running_loss = step_loss
+                    step_loss = (last_loss.item() if torch.is_tensor(last_loss) else last_loss) * config.gradient_accumulation_steps
+                    running_loss += step_loss
+                    self._grad_norm_sum += (grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm)
                 else:
                     step_loss = last_loss.item() * config.gradient_accumulation_steps
                     running_loss += step_loss
+                    self._grad_norm_sum += grad_norm
+                self._grad_norm_count += 1
                 self._tokens_processed += tokens_per_step
 
                 # ── Per-step terminal + file log (master only) ───────────
-                if self.iter_num % config.log_interval == 0 and self.iter_num > 0 and self.is_master:
-                    if self.use_tpu:
-                        # Only materialize the loss once every log_interval (10 steps)
-                        # This causes 1 sync every 10 steps instead of 1 sync every step,
-                        # maximizing pipelining speed.
-                        avg_loss = running_loss.item()
-                    else:
-                        avg_loss = running_loss / config.log_interval
-                    now = time.time()
-                    elapsed = now - start_time
-                    dt = now - self._last_log_time if self._last_log_time else 1.0
-                    tok_sec = (config.log_interval * tokens_per_step) / max(dt, 1e-6)
-                    self._last_log_time = now
-
-                    vram_alloc, vram_total = _vram_gb()
-                    steps_remaining = config.max_iters - self.iter_num
-                    sec_per_step = elapsed / max(self._steps_taken_since_resume, 1)
-                    eta = steps_remaining * sec_per_step
-                    eta_str = _format_eta(eta)
-
-                    if self.use_tpu:
-                        avg_gn = self._grad_norm_sum.item() if torch.is_tensor(self._grad_norm_sum) else self._grad_norm_sum
-                    else:
-                        avg_gn = self._grad_norm_sum / max(self._grad_norm_count, 1)
-
-                    # Terminal
-                    log_str = (
-                        f"[Step {self.iter_num:>7d}/{config.max_iters}]  "
-                        f"Tokens: {self._tokens_processed:,}  "
-                        f"loss={avg_loss:.4f}  lr={lr:.2e}  "
-                        f"grad_norm={avg_gn:.3f}  "
-                        f"tok/s={tok_sec:,.0f}"
-                    )
-                    if pbar:
-                        pbar.write(log_str)
-                    else:
-                        print(log_str)
-
-                    # TensorBoard
-                    if self.writer:
-                        self.writer.add_scalar("train/loss", avg_loss, self.iter_num)
-                        self.writer.add_scalar("train/lr", lr, self.iter_num)
-                        self.writer.add_scalar("train/grad_norm", avg_gn, self.iter_num)
-                        self.writer.add_scalar("train/tokens_per_sec", tok_sec, self.iter_num)
-
-                    # File log (one-line)
-                    if self.flog:
-                        self.flog.log_step(
-                            self.iter_num, config.max_iters, avg_loss, lr,
-                            avg_gn, tok_sec, vram_alloc, eta_str,
-                        )
-
-                    if self.use_tpu:
-                        running_loss = 0.0
-                    else:
-                        running_loss = 0.0
+                if self.iter_num % config.log_interval == 0 and self.iter_num > 0:
+                    avg_loss = running_loss / max(self._grad_norm_count, 1)
+                    avg_gn = self._grad_norm_sum / max(self._grad_norm_count, 1)
+                    running_loss = 0.0
                     self._grad_norm_sum = 0.0
                     self._grad_norm_count = 0
+
+                    if self.is_master:
+                        now = time.time()
+                        elapsed = now - start_time
+                        dt = now - self._last_log_time if self._last_log_time else 1.0
+                        tok_sec = (config.log_interval * tokens_per_step) / max(dt, 1e-6)
+                        self._last_log_time = now
+
+                        vram_alloc, vram_total = _vram_gb()
+                        steps_remaining = config.max_iters - self.iter_num
+                        sec_per_step = elapsed / max(self._steps_taken_since_resume, 1)
+                        eta = steps_remaining * sec_per_step
+                        eta_str = _format_eta(eta)
+
+                        # Terminal
+                        log_str = (
+                            f"[Step {self.iter_num:>7d}/{config.max_iters}]  "
+                            f"Tokens: {self._tokens_processed:,}  "
+                            f"loss={avg_loss:.4f}  lr={lr:.2e}  "
+                            f"grad_norm={avg_gn:.3f}  "
+                            f"tok/s={tok_sec:,.0f}"
+                        )
+                        if pbar:
+                            pbar.write(log_str)
+                        else:
+                            print(log_str)
+
+                        # TensorBoard
+                        if self.writer:
+                            self.writer.add_scalar("train/loss", avg_loss, self.iter_num)
+                            self.writer.add_scalar("train/lr", lr, self.iter_num)
+                            self.writer.add_scalar("train/grad_norm", avg_gn, self.iter_num)
+                            self.writer.add_scalar("train/tokens_per_sec", tok_sec, self.iter_num)
+
+                        # File log (one-line)
+                        if self.flog:
+                            self.flog.log_step(
+                                self.iter_num, config.max_iters, avg_loss, lr,
+                                avg_gn, tok_sec, vram_alloc, eta_str,
+                            )
 
                 # ── Evaluation ───────────────────────────────────────────
                 if self.iter_num % config.eval_interval == 0 and self.iter_num > 0 and self._steps_taken_since_resume > 0:
