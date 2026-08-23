@@ -10,7 +10,7 @@ class GPTConfig:
     n_head: int = 16          # Query heads
     n_kv_head: int = 4        # Key/Value heads (GQA grouping ratio = n_head / n_kv_head)
     n_layer: int = 52
-    block_size: int = 4096
+    block_size: int = 2048
     dropout: float = 0.0
     bias: bool = False
 
