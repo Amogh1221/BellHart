@@ -19,6 +19,13 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
 os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "2"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false"
 os.environ["ACCELERATE_LOG_LEVEL"] = "ERROR"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
@@ -26,6 +33,7 @@ logging.getLogger("torch.distributed").setLevel(logging.ERROR)
 logging.getLogger("torch.distributed.elastic").setLevel(logging.ERROR)
 logging.getLogger("accelerate").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
+torch.set_num_threads(2)
 
 # Clear Kaggle environment variables that conflict with PJRT
 os.environ.pop('TPU_PROCESS_ADDRESSES', None)
