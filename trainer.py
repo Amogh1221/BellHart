@@ -604,11 +604,7 @@ class Trainer:
                         loss = F.cross_entropy(
                             logits.view(-1, logits.size(-1)),
                             y.view(-1),
-                        )
-                        # Z-loss: prevents logit drift, improves stability (PaLM/Gemma)
-                        log_z = torch.logsumexp(logits.view(-1, logits.size(-1)).float(), dim=-1)
-                        z_loss = 1e-4 * (log_z ** 2).mean()
-                        loss = (loss + z_loss) / config.gradient_accumulation_steps
+                        ) / config.gradient_accumulation_steps
                     scaler.scale(loss).backward()
                 
                 # Save loss before deleting to avoid UnboundLocalError
@@ -616,8 +612,6 @@ class Trainer:
 
                 # Free huge activations (256MB) immediately before the next micro-step
                 del logits, loss
-                if not self.use_tpu:
-                    del log_z, z_loss
 
             self.micro_step += 1
             if pbar:

@@ -62,7 +62,7 @@ class GPTConfig:
 
     # ── EMA ──────────────────────────────────────────────────────────────
     ema_decay: float = 0.999
-    use_ema: bool = True
+    use_ema: bool = False
 
     # ── Gradient clipping ────────────────────────────────────────────────
     grad_clip: float = 1.0
