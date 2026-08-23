@@ -547,10 +547,10 @@ class Trainer:
         running_loss = 0.0
         start_time = time.time()
         self._last_log_time = start_time
-        self._tokens_processed = 0
-        self._steps_taken_since_resume = 0
-
+        
         tokens_per_step = self._get_tokens_per_step()
+        self._tokens_processed = self.iter_num * tokens_per_step
+        self._steps_taken_since_resume = 0
 
         if self.is_master:
             pbar = tqdm(
