@@ -434,6 +434,18 @@ class Trainer:
                                             operations=delete_ops, 
                                             commit_message=f"Cleanup old checkpoints (keeping latest {max_ckpt})"
                                         )
+                                        
+                                        # Squash history to permanently delete invisible LFS objects from HF backend
+                                        if hasattr(api, 'super_squash_history'):
+                                            try:
+                                                api.super_squash_history(
+                                                    repo_id=repo_id,
+                                                    repo_type="dataset",
+                                                    commit_message="Squash history to prevent LFS storage bloat"
+                                                )
+                                            except Exception as e:
+                                                print(f"Failed to squash history: {e}")
+                                                
                                 except Exception:
                                     pass
                             
