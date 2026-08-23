@@ -313,8 +313,8 @@ def main():
             print("  BellHart — TPU Training Mode")
             print("=" * 56)
             import torch_xla.distributed.xla_multiprocessing as xmp
-            # xmp.spawn launches _train_worker on all available TPU cores (1, 4, or 8)
-            xmp.spawn(_train_worker, args=(args.hf_token,), nprocs=None, start_method="fork")
+            # PJRT requires start_method="spawn", fork causes segfaults
+            xmp.spawn(_train_worker, args=(args.hf_token,), nprocs=None, start_method="spawn")
     else:
         print("=" * 56)
         print("  BellHart — GPU Training Mode")
