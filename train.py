@@ -33,15 +33,8 @@ def sync_huggingface(repo_id: str):
     os.makedirs("data", exist_ok=True)
     os.makedirs("tokenizer", exist_ok=True)
     os.makedirs("checkpoints", exist_ok=True)
-    os.makedirs("logs", exist_ok=True)
-    
     # Download dataset and tokenizer
-    try:
-        hf_hub_download(repo_id=repo_id, filename="tokenizer/tokenizer.json", repo_type="dataset", local_dir=".")
-    except Exception as e:
-        print(f"Failed to download tokenizer: {e}")
-    
-    # Download latest checkpoint and logs if they exist
+    # (Tokenizer is now checked into git as tokenizer.json)
     print("Checking for existing checkpoints and logs...")
     try:
         if not os.path.exists("checkpoints/latest.pt"):

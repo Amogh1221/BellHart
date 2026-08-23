@@ -7,7 +7,7 @@ class Tokenizer:
     def __init__(self, path: str | None = None):
         if path is None:
             path = str(
-                Path(__file__).resolve().parent / "tokenizer" / "tokenizer.json"
+                Path(__file__).resolve().parent / "tokenizer.json"
             )
         self._tok = HFTokenizer.from_file(path)
         self._vocab_size = self._tok.get_vocab_size()
