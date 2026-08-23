@@ -124,6 +124,12 @@ def _train_worker(index_or_token=None, hf_token=None):
     else:
         index = index_or_token
 
+    if not hf_token:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--hf_token", type=str, default="", help="HuggingFace WRITE Token")
+        args, _ = parser.parse_known_args()
+        hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
+
     is_ddp = int(os.environ.get('RANK', -1)) != -1
     
     if USE_TPU:
@@ -328,50 +334,7 @@ def _train_worker(index_or_token=None, hf_token=None):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--hf_token", type=str, default="", help="HuggingFace WRITE Token")
-    args, _ = parser.parse_known_args()
-
-    hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
-
-    if USE_TPU:
-        os.environ["PJRT_DEVICE"] = "TPU"
-        
-        # Check if already inside an active distributed worker process
-        is_already_worker = (
-            int(os.environ.get("RANK", -1)) != -1 
-            or int(os.environ.get("LOCAL_RANK", -1)) != -1
-            or os.environ.get("ACCELERATE_USE_TPU", "").lower() == "true"
-        )
-
-        if is_already_worker:
-            _train_worker(index_or_token=hf_token)
-        else:
-            if _is_proc_master():
-                print("=" * 56)
-                print("  BellHart — TPU Training Mode (8 cores)")
-                print("=" * 56)
-            import torch_xla.distributed.xla_multiprocessing as xmp
-            # In PJRT, nprocs=None automatically uses all 8 TPU cores cleanly
-            xmp.spawn(_train_worker, args=(hf_token,), nprocs=None)
-    else:
-        if _is_proc_master():
-            print("=" * 56)
-            print("  BellHart — GPU Training Mode")
-            print("=" * 56)
-        
-        is_ddp = int(os.environ.get('RANK', -1)) != -1
-        if is_ddp:
-            if int(os.environ.get('RANK', 0)) == 0:
-                print(f"Authenticating with HuggingFace (DDP Master)...")
-        else:
-            print(f"Authenticating with HuggingFace...")
-            
-        _train_worker(index_or_token=hf_token)
-
-    if not USE_TPU and int(os.environ.get('RANK', -1)) != -1:
-        import torch.distributed as dist
-        dist.destroy_process_group()
+    _train_worker()
 
 
 if __name__ == "__main__":
