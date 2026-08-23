@@ -51,9 +51,7 @@ class GPTConfig:
     tf32: bool = True
     use_8bit_optimizer: bool = False   # Use bitsandbytes PagedAdamW8bit (Linux/CUDA only)
 
-    # ── Dataset ─────────────────────────────────────────────────────────
-    dataset: str = "train.bin"
-    data_dir: str = "data"
+
 
     # ── Generation defaults ─────────────────────────────────────────────
     temperature: float = 0.8
