@@ -221,9 +221,6 @@ def _train_worker(index_or_token=None, hf_token=None):
         config.compile = False
         config.fused_adam = False
         config.gradient_checkpointing = 1
-        # Cap block size to 2048 on TPU to keep attention graph within fast compilation memory limits
-        if config.block_size > 2048:
-            config.block_size = 2048
         # TPU v3 has 15.75G HBM per core — batch_size=1 with gradient checkpointing
         # drops activation memory to <1GB HBM, fitting easily on all TPU variants.
         original_effective_batch = config.batch_size * config.gradient_accumulation_steps
