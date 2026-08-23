@@ -246,19 +246,19 @@ class Trainer:
                 print("Compiling model.forward (regional)...")
             self.model.forward = torch.compile(self.model.forward, mode="default")
 
-        # Multi-device wrapping
+        # Multi-device wrapping (GPU only; TPU handles multi-core via xm.optimizer_step)
         self.is_ddp = is_ddp
-        if self.is_ddp:
+        if self.is_ddp and not self.use_tpu:
             if self.is_master:
                 print(f"Wrapping model with DistributedDataParallel (DDP).")
             from torch.nn.parallel import DistributedDataParallel as DDP
-            ddp_local_rank = int(os.environ['LOCAL_RANK'])
+            ddp_local_rank = int(os.environ.get('LOCAL_RANK', 0))
             self.model = DDP(self.model, device_ids=[ddp_local_rank])
 
-        self.optimizer = (self.model.module if self.is_ddp else self.model).configure_optimizers(config)
+        self.optimizer = (self.model.module if (self.is_ddp and not self.use_tpu) else self.model).configure_optimizers(config)
 
         self.ema = (
-            EMA(self.model.module if self.is_ddp else self.model, decay=config.ema_decay) if config.use_ema else None
+            EMA(self.model.module if (self.is_ddp and not self.use_tpu) else self.model, decay=config.ema_decay) if config.use_ema else None
         )
 
         # GradScaler only needed for float16 on GPU
