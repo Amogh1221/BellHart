@@ -486,7 +486,7 @@ class Trainer:
             torch.cuda.empty_cache()
 
     def generate_samples(self):
-        if not self.is_master:
+        if not self.is_master or self.use_tpu:
             return
         base_model = self.model.module if hasattr(self.model, "module") else self.model
         base_model.eval()
