@@ -418,6 +418,11 @@ class Trainer:
                                     path_or_fileobj=sync_path
                                 ))
                                 
+                            # Also update latest.pt on Hugging Face
+                            upload_ops.append(CommitOperationAdd(
+                                path_in_repo="checkpoints/latest.pt",
+                                path_or_fileobj=sync_path
+                            ))
 
                             # Add logs operation
                             if os.path.exists("logs/training_log.txt"):
@@ -502,6 +507,8 @@ class Trainer:
         del ckpt
         if not self.use_tpu and torch.cuda.is_available():
             torch.cuda.empty_cache()
+        if self.is_master:
+            print(f"Loaded checkpoint from {path} (iteration {self.iter_num}, best val loss: {self.best_val_loss:.4f})")
 
     def generate_samples(self):
         if not self.is_master or self.use_tpu:

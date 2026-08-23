@@ -72,16 +72,46 @@ def sync_huggingface(repo_id: str):
     if _is_proc_master():
         print("Checking for existing checkpoints and logs...")
     try:
-        if not os.path.exists("checkpoints/latest.pt"):
-            hf_hub_download(repo_id=repo_id, filename="checkpoints/latest.pt", repo_type="dataset", local_dir=".")
-            if _is_proc_master():
-                print("Successfully downloaded latest.pt")
+        import re
+        from huggingface_hub import HfApi
+        hf_token = os.environ.get("HF_TOKEN")
+        api = HfApi(token=hf_token)
+        files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+
+        # Find all checkpoint files on HF
+        ckpt_files = [f for f in files if re.match(r"^checkpoints/checkpoint-\d+\.pt$", f)]
+        if ckpt_files:
+            # Sort by step number descending
+            ckpt_files.sort(
+                key=lambda x: int(re.search(r"checkpoint-(\d+)\.pt", x).group(1)),
+                reverse=True
+            )
+            latest_ckpt_file = ckpt_files[0]
+            if not os.path.exists(latest_ckpt_file):
+                if _is_proc_master():
+                    print(f"Downloading latest checkpoint {latest_ckpt_file} from HuggingFace...")
+                hf_hub_download(repo_id=repo_id, filename=latest_ckpt_file, repo_type="dataset", local_dir=".")
+                if _is_proc_master():
+                    print(f"Successfully downloaded {latest_ckpt_file}")
+            else:
+                if _is_proc_master():
+                    print(f"Found {latest_ckpt_file} locally, skipping download.")
+        elif "checkpoints/latest.pt" in files:
+            if not os.path.exists("checkpoints/latest.pt"):
+                if _is_proc_master():
+                    print("Downloading checkpoints/latest.pt from HuggingFace...")
+                hf_hub_download(repo_id=repo_id, filename="checkpoints/latest.pt", repo_type="dataset", local_dir=".")
+                if _is_proc_master():
+                    print("Successfully downloaded latest.pt")
+            else:
+                if _is_proc_master():
+                    print("Found checkpoints/latest.pt locally, skipping download.")
         else:
             if _is_proc_master():
-                print("Found checkpoints/latest.pt locally, skipping download.")
-    except Exception:
+                print("No existing checkpoint found on HuggingFace.")
+    except Exception as e:
         if _is_proc_master():
-            print("No existing checkpoint found on HuggingFace.")
+            print(f"No existing checkpoint found on HuggingFace ({e}).")
         
     try:
         hf_hub_download(repo_id=repo_id, filename="logs/training_log.txt", repo_type="dataset", local_dir=".")
@@ -344,11 +374,22 @@ def _train_worker(index_or_token=None, hf_token=None):
     trainer = Trainer(config, tokenizer, train_loader, val_loader, is_ddp=is_ddp)
 
     import glob
+    import re
     checkpoints = glob.glob("checkpoints/checkpoint-*.pt")
-    if checkpoints:
+    valid_checkpoints = [f for f in checkpoints if re.search(r"checkpoint-(\d+)\.pt", os.path.basename(f))]
+    if valid_checkpoints:
         # Sort by step number
-        resume_path = sorted(checkpoints, key=lambda x: int(x.split('-')[-1].split('.')[0]))[-1]
+        resume_path = sorted(
+            valid_checkpoints,
+            key=lambda x: int(re.search(r"checkpoint-(\d+)\.pt", os.path.basename(x)).group(1))
+        )[-1]
+        if is_master:
+            print(f"Resuming training from checkpoint: {resume_path}")
         trainer.load_checkpoint(resume_path)
+    elif os.path.exists("checkpoints/latest.pt"):
+        if is_master:
+            print("Resuming training from checkpoint: checkpoints/latest.pt")
+        trainer.load_checkpoint("checkpoints/latest.pt")
 
     try:
         trainer.train()
