@@ -188,12 +188,15 @@ def _train_worker(index=None, hf_token=None):
         if vram_gb >= 70:       # H100 80GB / A100 80GB
             new_batch = 16
             config.compile = True
+            config.save_interval = 400
         elif vram_gb >= 35:     # A100 40GB
             new_batch = 8
             config.compile = True
+            config.save_interval = 200
         elif vram_gb >= 20:     # RTX 3090/4090 24GB
             new_batch = 4
             config.compile = True
+            config.save_interval = 100
         else:                   # T4 16GB / RTX 3060 etc.
             new_batch = 1
             config.use_8bit_optimizer = True
