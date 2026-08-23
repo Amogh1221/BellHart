@@ -296,6 +296,15 @@ def _train_worker(index=None, hf_token=None):
         sys.exit(0)
 
 
+def _tpu_worker_wrapper(index, hf_token):
+    # We set PJRT variables dynamically inside the spawned process
+    # so the master process NEVER imports torch_xla and never locks the TPU.
+    import os
+    os.environ['PJRT_DEVICE'] = 'TPU'
+    # Use 8 cores since Kaggle TPU v3-8 has 8 cores
+    _train_worker(index, hf_token)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hf_token", type=str, required=True, help="HuggingFace WRITE Token")
@@ -314,14 +323,6 @@ def main():
             print("  BellHart — TPU Training Mode")
             print("=" * 56)
             import torch.multiprocessing as mp
-            
-            def _tpu_worker_wrapper(index, hf_token):
-                # We set PJRT variables dynamically inside the spawned process
-                # so the master process NEVER imports torch_xla and never locks the TPU.
-                os.environ['PJRT_DEVICE'] = 'TPU'
-                # Use 8 cores since Kaggle TPU v3-8 has 8 cores
-                _train_worker(index, hf_token)
-                
             # Spawn 8 fresh Python processes. Because the master process hasn't
             # imported torch_xla, the TPU hardware is completely free and untouched.
             mp.spawn(_tpu_worker_wrapper, args=(args.hf_token,), nprocs=8, start_method="spawn")
