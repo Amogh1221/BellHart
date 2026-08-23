@@ -415,19 +415,20 @@ class GPT(nn.Module):
         if config.use_8bit_optimizer:
             try:
                 import bitsandbytes as bnb
-                optimizer = bnb.optim.PagedAdamW8bit(
+                optimizer = bnb.optim.AdamW8bit(
                     optim_groups,
                     lr=config.learning_rate,
                     betas=(config.beta1, config.beta2),
                 )
-                print("  Using bitsandbytes PagedAdamW8bit optimizer")
+                print("  Using bitsandbytes AdamW8bit optimizer (Non-Paged)")
                 return optimizer
             except ImportError:
                 print("  bitsandbytes not available, falling back to standard AdamW")
 
         # Standard AdamW
-        fused_available = "fused" in torch.__dict__
-        use_fused = fused_available and config.fused_adam and config.device == "cuda"
+        import inspect
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and config.fused_adam
         if config.device != "cuda":
             use_fused = False
 

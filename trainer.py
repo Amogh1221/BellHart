@@ -610,6 +610,11 @@ class Trainer:
                         z_loss = 1e-4 * (log_z ** 2).mean()
                         loss = (loss + z_loss) / config.gradient_accumulation_steps
                     scaler.scale(loss).backward()
+                
+                # Free huge activations (256MB) immediately before the next micro-step
+                del logits, loss
+                if not self.use_tpu:
+                    del log_z, z_loss
 
             self.micro_step += 1
             if pbar:
