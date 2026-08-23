@@ -20,6 +20,7 @@ logging.getLogger("torch.distributed.elastic").setLevel(logging.ERROR)
 # Clear Kaggle environment variables that conflict with PJRT
 os.environ.pop('TPU_PROCESS_ADDRESSES', None)
 os.environ.pop('CLOUD_TPU_TASK_ID', None)
+os.environ['PYTHONFAULTHANDLER'] = '1'
 
 from huggingface_hub import login, hf_hub_download
 
@@ -312,9 +313,18 @@ def main():
             print("=" * 56)
             print("  BellHart — TPU Training Mode")
             print("=" * 56)
-            import torch_xla.distributed.xla_multiprocessing as xmp
-            # PJRT requires start_method="spawn", fork causes segfaults
-            xmp.spawn(_train_worker, args=(args.hf_token,), nprocs=None, start_method="spawn")
+            import torch.multiprocessing as mp
+            
+            def _tpu_worker_wrapper(index, hf_token):
+                # We set PJRT variables dynamically inside the spawned process
+                # so the master process NEVER imports torch_xla and never locks the TPU.
+                os.environ['PJRT_DEVICE'] = 'TPU'
+                # Use 8 cores since Kaggle TPU v3-8 has 8 cores
+                _train_worker(index, hf_token)
+                
+            # Spawn 8 fresh Python processes. Because the master process hasn't
+            # imported torch_xla, the TPU hardware is completely free and untouched.
+            mp.spawn(_tpu_worker_wrapper, args=(args.hf_token,), nprocs=8, start_method="spawn")
     else:
         print("=" * 56)
         print("  BellHart — GPU Training Mode")
