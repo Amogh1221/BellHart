@@ -570,20 +570,8 @@ class Trainer:
 
         while self.iter_num < config.max_iters:
             lr = get_lr(self.iter_num, config)
-            if self.use_tpu:
-                # To prevent graph recompilation, the learning rate must be an XLA tensor.
-                # CRITICAL: We must update the SAME tensor in-place (.copy_). If we assign
-                # a new tensor every step, it breaks the XLA graph node ID and deadlocks.
-                if not hasattr(self, "_lr_tensor"):
-                    self._lr_tensor = torch.tensor(lr, dtype=torch.float32, device=xm.xla_device())
-                    for param_group in optimizer.param_groups:
-                        param_group["lr"] = self._lr_tensor
-                else:
-                    # Asynchronously copy the new scalar value into the existing graph node
-                    self._lr_tensor.copy_(torch.tensor(lr, dtype=torch.float32))
-            else:
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = lr
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
             x, y = self.get_batch("train")
 
