@@ -25,7 +25,9 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false"
+os.environ["XLA_FLAGS"] = "--xla_memory_scheduler=kBrkga --xla_cpu_multi_thread_eigen=false"
+os.environ["XLA_PERSISTENT_CACHE_PATH"] = "/tmp/xla_cache"
+os.environ["LIBTPU_PERSISTENT_CACHE_PATH"] = "/tmp/xla_cache"
 os.environ["ACCELERATE_LOG_LEVEL"] = "ERROR"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
@@ -219,6 +221,9 @@ def _train_worker(index_or_token=None, hf_token=None):
         config.compile = False
         config.fused_adam = False
         config.gradient_checkpointing = 1
+        # Cap block size to 2048 on TPU to keep attention graph within fast compilation memory limits
+        if config.block_size > 2048:
+            config.block_size = 2048
         # TPU v3 has 15.75G HBM per core — batch_size=1 with gradient checkpointing
         # drops activation memory to <1GB HBM, fitting easily on all TPU variants.
         original_effective_batch = config.batch_size * config.gradient_accumulation_steps
@@ -239,7 +244,7 @@ def _train_worker(index_or_token=None, hf_token=None):
         config.gradient_accumulation_steps = new_grad_accum
         if is_master:
             print(f"TPU detected ({num_cores} cores)")
-            print(f"batch_size: {config.batch_size}  grad_accum: {config.gradient_accumulation_steps}  "
+            print(f"block_size: {config.block_size}  batch_size: {config.batch_size}  grad_accum: {config.gradient_accumulation_steps}  "
                   f"(effective batch = {config.batch_size * num_cores * new_grad_accum})")
             print(f"gradient_checkpointing: {config.gradient_checkpointing} (HBM memory optimized)")
             print(f"preload forced to False to prevent CPU OOM")
