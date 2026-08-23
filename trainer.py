@@ -611,6 +611,9 @@ class Trainer:
                         loss = (loss + z_loss) / config.gradient_accumulation_steps
                     scaler.scale(loss).backward()
                 
+                # Save loss before deleting to avoid UnboundLocalError
+                last_loss = loss.detach()
+
                 # Free huge activations (256MB) immediately before the next micro-step
                 del logits, loss
                 if not self.use_tpu:
@@ -676,10 +679,10 @@ class Trainer:
                 if self.use_tpu:
                     # On TPU, do not accumulate running loss to avoid graph history memory leaks.
                     # Just save the detached tensor from the last step.
-                    step_loss = loss.detach() * config.gradient_accumulation_steps
+                    step_loss = last_loss * config.gradient_accumulation_steps
                     running_loss = step_loss
                 else:
-                    step_loss = loss.item() * config.gradient_accumulation_steps
+                    step_loss = last_loss.item() * config.gradient_accumulation_steps
                     running_loss += step_loss
                 self._tokens_processed += tokens_per_step
 
