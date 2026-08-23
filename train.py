@@ -88,14 +88,31 @@ def _train_worker(index=None, hf_token=None):
     """
     Core training function. Runs once on GPU, or is spawned per-core on TPU.
     """
-    # On TPU, only the master ordinal should print setup info
-    is_master = True
+    is_ddp = int(os.environ.get('RANK', -1)) != -1
+    if is_ddp:
+        import torch.distributed as dist
+        dist.init_process_group("nccl")
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        torch.cuda.set_device(ddp_local_rank)
+        is_master = ddp_rank == 0
+        seed_offset = ddp_rank
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        is_master = True
+        seed_offset = 0
+
     if USE_TPU:
         try:
             import torch_xla.runtime as xr
             is_master = xr.global_ordinal() == 0
+            seed_offset = xr.global_ordinal()
         except (ImportError, AttributeError):
             is_master = xm.is_master_ordinal(local=False)
+            seed_offset = xm.get_ordinal()
         # Set BF16 natively on TPU
         os.environ["XLA_USE_BF16"] = "1"
 
@@ -157,8 +174,13 @@ def _train_worker(index=None, hf_token=None):
             print(f"preload forced to False to prevent CPU OOM")
     elif torch.cuda.is_available():
         # ── Dynamic GPU VRAM auto-scaling ─────────────────────────────────
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-        original_effective_batch = config.batch_size * config.gradient_accumulation_steps
+        vram_gb = torch.cuda.get_device_properties(ddp_local_rank).total_memory / 1e9
+        
+        if is_ddp:
+            # If DDP, original_effective_batch is divided among world_size
+            original_effective_batch = config.batch_size * config.gradient_accumulation_steps
+        else:
+            original_effective_batch = config.batch_size * config.gradient_accumulation_steps
 
         # Scale batch_size based on available VRAM
         if vram_gb >= 70:       # H100 80GB / A100 80GB
@@ -172,15 +194,22 @@ def _train_worker(index=None, hf_token=None):
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
 
-        config.batch_size = new_batch
-        config.gradient_accumulation_steps = max(1, original_effective_batch // new_batch)
-
         # Scale eval_iters inversely so validation takes the same time
         base_eval_tokens = 200 * 2  # original: 200 iters * batch_size 2
         config.eval_iters = max(10, base_eval_tokens // new_batch)
 
+        if is_ddp:
+            # Adjust grad_accum so the global batch size matches original_effective_batch
+            # Global batch = new_batch * ddp_world_size * new_grad_accum
+            target_accum = max(1, original_effective_batch // (new_batch * ddp_world_size))
+            config.gradient_accumulation_steps = target_accum
+            config.batch_size = new_batch
+        else:
+            config.batch_size = new_batch
+            config.gradient_accumulation_steps = max(1, original_effective_batch // new_batch)
+
         # Enable hardware optimizations for Ampere+ GPUs (A100/H100/RTX 30xx+)
-        gpu_name = torch.cuda.get_device_name(0).upper()
+        gpu_name = torch.cuda.get_device_name(ddp_local_rank).upper()
         is_ampere_plus = vram_gb >= 20 or any(tag in gpu_name for tag in ["A100", "H100", "H200", "RTX 30", "RTX 40", "RTX 50"])
 
         if is_ampere_plus:
@@ -212,9 +241,10 @@ def _train_worker(index=None, hf_token=None):
         block_size=config.block_size,
         batch_size=config.batch_size,
         num_workers=1,
+        seed=42 + seed_offset,
     )
 
-    trainer = Trainer(config, tokenizer, train_loader, val_loader)
+    trainer = Trainer(config, tokenizer, train_loader, val_loader, is_ddp=is_ddp)
 
     import glob
     checkpoints = glob.glob("checkpoints/checkpoint-*.pt")
@@ -249,8 +279,19 @@ def main():
         print("=" * 56)
         print("  BellHart — GPU Training Mode")
         print("=" * 56)
-        print(f"Authenticating with HuggingFace...")
+        
+        is_ddp = int(os.environ.get('RANK', -1)) != -1
+        if is_ddp:
+            if int(os.environ.get('RANK', 0)) == 0:
+                print(f"Authenticating with HuggingFace (DDP Master)...")
+        else:
+            print(f"Authenticating with HuggingFace...")
+            
         _train_worker(index=None, hf_token=args.hf_token)
+
+    if int(os.environ.get('RANK', -1)) != -1:
+        import torch.distributed as dist
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

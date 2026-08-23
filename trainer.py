@@ -208,7 +208,7 @@ class FileLogger:
 
 
 class Trainer:
-    def __init__(self, config: GPTConfig, tokenizer, train_loader, val_loader):
+    def __init__(self, config: GPTConfig, tokenizer, train_loader, val_loader, is_ddp=False):
         self.config = config
         self.tokenizer = tokenizer
         self.use_tpu = (config.device == "xla")
@@ -244,12 +244,13 @@ class Trainer:
             self.model = torch.compile(self.model, mode="default")
 
         # Multi-device wrapping
-        self.is_ddp = False
-        if not self.use_tpu and torch.cuda.device_count() > 1:
+        self.is_ddp = is_ddp
+        if self.is_ddp:
             if self.is_master:
-                print(f"Detected {torch.cuda.device_count()} GPUs. Wrapping with DataParallel.")
-            self.model = torch.nn.DataParallel(self.model)
-            self.is_ddp = True
+                print(f"Wrapping model with DistributedDataParallel (DDP).")
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            ddp_local_rank = int(os.environ['LOCAL_RANK'])
+            self.model = DDP(self.model, device_ids=[ddp_local_rank])
 
         self.optimizer = (self.model.module if self.is_ddp else self.model).configure_optimizers(config)
 
