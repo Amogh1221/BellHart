@@ -715,6 +715,15 @@ class Trainer:
                 self._grad_norm_count += 1
                 self._tokens_processed += tokens_per_step
 
+                # Periodic host RAM cleanup to prevent OOM killer on cloud VMs
+                import gc
+                gc.collect()
+                try:
+                    import ctypes
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
+
                 # ── Per-step terminal + file log (master only) ───────────
                 if self.iter_num % config.log_interval == 0 and self.iter_num > 0:
                     avg_loss = running_loss / max(self._grad_norm_count, 1)
