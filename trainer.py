@@ -658,6 +658,12 @@ class Trainer:
                 # Free activations and batch tensors immediately before next micro-step
                 del logits, loss, x, y
 
+                try:
+                    import ctypes
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
+
             self.micro_step += 1
             if pbar:
                 micro = self.micro_step % config.gradient_accumulation_steps

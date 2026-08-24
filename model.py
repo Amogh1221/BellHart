@@ -303,7 +303,7 @@ class GPT(nn.Module):
                     x = xla_ckpt.checkpoint(block.forward_checkpoint, x, rope_cos, rope_sin)
                 else:
                     x = torch.utils.checkpoint.checkpoint(
-                        block.forward_checkpoint, x, rope_cos, rope_sin, use_reentrant=False
+                        block.forward_checkpoint, x, rope_cos, rope_sin, use_reentrant=True
                     )
                 present = None
             else:

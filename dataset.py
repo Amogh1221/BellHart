@@ -19,7 +19,7 @@ class HFStreamingDataset(IterableDataset):
     Streams data from a HuggingFace dataset, tokenizes it on the fly, 
     and yields (x, y) chunks of block_size.
     """
-    def __init__(self, dataset_name: str, split: str, tokenizer, block_size: int, buffer_size: int = 100, seed: int = 42, config_name: str = None, rank: int = 0, world_size: int = 1):
+    def __init__(self, dataset_name: str, split: str, tokenizer, block_size: int, buffer_size: int = 10, seed: int = 42, config_name: str = None, rank: int = 0, world_size: int = 1):
         super().__init__()
         self.dataset_name = dataset_name
         self.config_name = config_name
@@ -55,7 +55,7 @@ class HFStreamingDataset(IterableDataset):
                 if self.world_size > 1:
                     dataset = dataset.shard(num_shards=self.world_size, index=self.rank)
                     
-                # Shuffle the stream
+                # Shuffle the stream with a small buffer to save host RAM
                 dataset = dataset.shuffle(buffer_size=self.buffer_size, seed=seed)
 
                 for example in dataset:
@@ -66,6 +66,7 @@ class HFStreamingDataset(IterableDataset):
                     # Tokenize
                     tokens = self.tokenizer.encode(text)
                     buffer.extend(tokens)
+                    del text, tokens
 
                     # Yield chunks
                     while len(buffer) >= chunk_size:
