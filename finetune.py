@@ -60,25 +60,40 @@ class ChatDataset(Dataset):
     def __getitem__(self, idx):
         messages = self.data[idx]["messages"]
 
-        text = ""
-        for msg in messages:
-            if msg["role"] == "system":
-                text += f"System: {msg['content']}\n\n"
-            elif msg["role"] == "user":
-                text += f"User: {msg['content']}\n"
-            elif msg["role"] == "assistant":
-                text += f"Assistant: {msg['content']}\n"
+        tokens = []
+        labels = []
 
-        # Tokenize and append end-of-text token
-        tokens = self.tokenizer.encode(text)
-        tokens.append(self.tokenizer.eot_token)
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "system":
+                chunk_text = f"System: {content}\n\n"
+                chunk_tokens = self.tokenizer.encode(chunk_text)
+                tokens.extend(chunk_tokens)
+                labels.extend([-100] * len(chunk_tokens))  # Mask system prompt
+            elif role == "user":
+                chunk_text = f"User: {content}\n"
+                chunk_tokens = self.tokenizer.encode(chunk_text)
+                tokens.extend(chunk_tokens)
+                labels.extend([-100] * len(chunk_tokens))  # Mask user prompt
+            elif role == "assistant":
+                chunk_text = f"Assistant: {content}\n"
+                chunk_tokens = self.tokenizer.encode(chunk_text)
+                tokens.extend(chunk_tokens)
+                labels.extend(chunk_tokens)  # Train on assistant responses
+
+        # Append end-of-text token
+        eot = self.tokenizer.eot_token
+        tokens.append(eot)
+        labels.append(eot)
 
         # Truncate to max_length + 1 so we get exactly max_length for x and y
         if len(tokens) > self.max_length + 1:
             tokens = tokens[: self.max_length + 1]
+            labels = labels[: self.max_length + 1]
 
         x_tokens = tokens[:-1]
-        y_tokens = tokens[1:]
+        y_tokens = labels[1:]
 
         # Pad x with 0, but pad y with -100 (PyTorch ignores -100 in cross_entropy)
         pad_len = self.max_length - len(x_tokens)

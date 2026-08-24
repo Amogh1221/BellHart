@@ -365,7 +365,7 @@ def _train_worker(index_or_token=None, hf_token=None):
         block_size=config.block_size,
         batch_size=config.batch_size,
         num_workers=0,
-        pin_memory=False,
+        pin_memory=(config.device == "cuda"),
         seed=42 + seed_offset,
         rank=global_rank,
         world_size=world_size,

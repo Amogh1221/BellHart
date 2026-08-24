@@ -142,10 +142,10 @@ class GroupedQueryAttention(nn.Module):
 
         present = (k.detach(), v.detach())
 
-        # Expand KV heads to match Q heads via repeat_interleave
+        # Expand KV heads to match Q heads via non-allocating view expansion
         if self.n_rep > 1:
-            k = k.repeat_interleave(self.n_rep, dim=1)
-            v = v.repeat_interleave(self.n_rep, dim=1)
+            k = k[:, :, None, :, :].expand(B, self.n_kv_head, self.n_rep, k.size(2), self.head_dim).reshape(B, self.n_head, k.size(2), self.head_dim)
+            v = v[:, :, None, :, :].expand(B, self.n_kv_head, self.n_rep, v.size(2), self.head_dim).reshape(B, self.n_head, v.size(2), self.head_dim)
 
         # Scaled dot-product attention (dispatches to FlashAttention when available)
         is_causal = T > 1 and layer_past is None
@@ -303,7 +303,7 @@ class GPT(nn.Module):
                     x = xla_ckpt.checkpoint(block.forward_checkpoint, x, rope_cos, rope_sin)
                 else:
                     x = torch.utils.checkpoint.checkpoint(
-                        block.forward_checkpoint, x, rope_cos, rope_sin, use_reentrant=True
+                        block.forward_checkpoint, x, rope_cos, rope_sin, use_reentrant=False
                     )
                 present = None
             else:
