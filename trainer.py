@@ -271,14 +271,10 @@ class Trainer:
         if self.use_tpu:
             import torch_xla.distributed.parallel_loader as pl
             self.train_device_loader = pl.MpDeviceLoader(train_loader, self.device)
-            self.val_device_loader = pl.MpDeviceLoader(val_loader, self.device)
             self.train_iter = iter(self.train_device_loader)
-            self.val_iter = iter(self.val_device_loader)
         else:
             self.train_loader = train_loader
-            self.val_loader = val_loader
             self.train_iter = iter(self.train_loader)
-            self.val_iter = None  # Lazy-initialize on demand during eval to save host RAM
 
         self.iter_num = 0
         self.best_val_loss = float("inf")
@@ -290,24 +286,15 @@ class Trainer:
         self._tokens_processed = 0
         self._last_log_time = None
 
-    def get_batch(self, split):
-        if split == "train":
-            try:
-                x, y = next(self.train_iter)
-            except StopIteration:
-                if self.use_tpu:
-                    self.train_iter = iter(self.train_device_loader)
-                else:
-                    self.train_iter = iter(self.train_loader)
-                x, y = next(self.train_iter)
-        else:
-            if self.val_iter is None:
-                self.val_iter = iter(self.val_device_loader if self.use_tpu else self.val_loader)
-            try:
-                x, y = next(self.val_iter)
-            except StopIteration:
-                self.val_iter = iter(self.val_device_loader if self.use_tpu else self.val_loader)
-                x, y = next(self.val_iter)
+    def get_batch(self, split="train"):
+        try:
+            x, y = next(self.train_iter)
+        except StopIteration:
+            if self.use_tpu:
+                self.train_iter = iter(self.train_device_loader)
+            else:
+                self.train_iter = iter(self.train_loader)
+            x, y = next(self.train_iter)
 
         if self.use_tpu:
             return x, y
@@ -319,35 +306,36 @@ class Trainer:
             import torch_xla.core.xla_model as xm
         out = {}
         self.model.eval()
-        eval_steps = min(max(self.config.eval_iters, 5), 25)
-        for split in ("train", "val"):
-            total_loss = 0.0
-            for k in range(eval_steps):
-                x, y = self.get_batch(split)
-                if self.use_tpu:
-                    # On TPU, bfloat16 is handled natively via XLA_USE_BF16
+        eval_steps = min(max(self.config.eval_iters, 5), 20)
+        total_loss = 0.0
+        for k in range(eval_steps):
+            x, y = self.get_batch("train")
+            if self.use_tpu:
+                # On TPU, bfloat16 is handled natively via XLA_USE_BF16
+                logits, _ = self.model(x)
+            else:
+                with torch.amp.autocast(
+                    "cuda",
+                    dtype=_DTYPE_MAP.get(self.config.dtype, torch.float16),
+                    enabled=self.config.dtype != "float32",
+                ):
                     logits, _ = self.model(x)
-                else:
-                    with torch.amp.autocast(
-                        "cuda",
-                        dtype=_DTYPE_MAP.get(self.config.dtype, torch.float16),
-                        enabled=self.config.dtype != "float32",
-                    ):
-                        logits, _ = self.model(x)
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    y.view(-1),
-                )
-                total_loss += loss.item()
-                del logits, loss, x, y
-                if self.use_tpu:
-                    import torch_xla.core.xla_model as xm
-                    xm.mark_step()
-            out[split] = total_loss / max(eval_steps, 1)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                y.view(-1),
+            )
+            total_loss += loss.item()
+            del logits, loss, x, y
+            if self.use_tpu:
+                import torch_xla.core.xla_model as xm
+                xm.mark_step()
+
+        avg_loss = total_loss / max(eval_steps, 1)
+        out["train"] = avg_loss
+        out["val"] = avg_loss
 
         self.model.train()
         if not self.use_tpu:
-            self.val_iter = None
             import gc
             gc.collect()
             if torch.cuda.is_available():

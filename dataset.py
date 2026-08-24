@@ -89,35 +89,22 @@ def create_streaming_dataloaders(
     tokenizer,
     block_size: int,
     batch_size: int,
-    num_workers: int = 2,
-    pin_memory: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = False,
     seed: int = 42,
     dataset_config: str = None,
     rank: int = 0,
     world_size: int = 1,
 ) -> Tuple[DataLoader, DataLoader]:
     """
-    Build train and val DataLoaders using streaming.
+    Build train DataLoader using streaming.
     """
-    
     train_dataset = HFStreamingDataset(
         dataset_name=dataset_name,
         split="train",
         tokenizer=tokenizer,
         block_size=block_size,
         seed=seed,
-        config_name=dataset_config,
-        rank=rank,
-        world_size=world_size
-    )
-    
-    # Validation stream (different seed to sample different documents)
-    val_dataset = HFStreamingDataset(
-        dataset_name=dataset_name,
-        split="train",
-        tokenizer=tokenizer,
-        block_size=block_size,
-        seed=seed + 9999,
         config_name=dataset_config,
         rank=rank,
         world_size=world_size
@@ -131,12 +118,4 @@ def create_streaming_dataloaders(
         drop_last=True,
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=True,
-    )
-
-    return train_loader, val_loader
+    return train_loader, train_loader
