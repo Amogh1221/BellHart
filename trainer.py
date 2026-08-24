@@ -319,9 +319,10 @@ class Trainer:
             import torch_xla.core.xla_model as xm
         out = {}
         self.model.eval()
+        eval_steps = min(max(self.config.eval_iters, 5), 25)
         for split in ("train", "val"):
-            losses = torch.zeros(self.config.eval_iters, device=self.device)
-            for k in range(self.config.eval_iters):
+            total_loss = 0.0
+            for k in range(eval_steps):
                 x, y = self.get_batch(split)
                 if self.use_tpu:
                     # On TPU, bfloat16 is handled natively via XLA_USE_BF16
@@ -337,16 +338,20 @@ class Trainer:
                     logits.view(-1, logits.size(-1)),
                     y.view(-1),
                 )
-                losses[k] = loss
+                total_loss += loss.item()
+                del logits, loss, x, y
                 if self.use_tpu:
                     import torch_xla.core.xla_model as xm
                     xm.mark_step()
-            out[split] = losses.mean().item()
+            out[split] = total_loss / max(eval_steps, 1)
+
         self.model.train()
         if not self.use_tpu:
             self.val_iter = None
             import gc
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             try:
                 import ctypes
                 ctypes.CDLL("libc.so.6").malloc_trim(0)

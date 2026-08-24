@@ -36,7 +36,7 @@ class GPTConfig:
     lr_decay_iters: int = 100000
     min_lr: float = 3e-5
     eval_interval: int = 200
-    eval_iters: int = 200
+    eval_iters: int = 20
     log_interval: int = 1
     save_interval: int = 20
     gen_interval: int = 5000

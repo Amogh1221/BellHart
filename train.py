@@ -318,9 +318,9 @@ def _train_worker(index_or_token=None, hf_token=None):
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
 
-        # Scale eval_iters inversely so validation takes the same time
-        base_eval_tokens = 200 * 2  # original: 200 iters * batch_size 2
-        config.eval_iters = max(10, base_eval_tokens // new_batch)
+        # Set eval_iters reasonably to prevent streaming buffer explosion
+        base_eval_batches = 20
+        config.eval_iters = max(5, base_eval_batches // new_batch)
 
         if is_ddp:
             # Adjust grad_accum so the global batch size matches original_effective_batch
