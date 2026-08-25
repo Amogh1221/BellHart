@@ -143,11 +143,11 @@ class FileLogger:
         if flush:
             self.file.flush()
 
-    def log_step(self, step, total, loss, lr, grad_norm, tok_sec, vram_alloc, eta_str, tokens=0):
+    def log_step(self, step, total, loss, lr, grad_norm, tok_sec, tokens=0):
         line = (
             f"[{self._ts()}] STEP {step:>7d}/{total} | Tokens: {tokens:,} | "
             f"loss={loss:.4f} | lr={lr:.2e} | grad_norm={grad_norm:.3f} | "
-            f"tok/s={tok_sec:,.0f} | VRAM={vram_alloc:.1f}GB | ETA={eta_str}"
+            f"tok/s={tok_sec:,.0f}"
         )
         self.write(line)
 
@@ -745,12 +745,6 @@ class Trainer:
                         tok_sec = (config.log_interval * tokens_per_step) / max(dt, 1e-6)
                         self._last_log_time = now
 
-                        vram_alloc, vram_total = _vram_gb()
-                        steps_remaining = config.max_iters - self.iter_num
-                        sec_per_step = elapsed / max(self._steps_taken_since_resume, 1)
-                        eta = steps_remaining * sec_per_step
-                        eta_str = _format_eta(eta)
-
                         # Terminal
                         log_str = (
                             f"[Step {self.iter_num:>7d}/{config.max_iters}]  "
@@ -775,7 +769,7 @@ class Trainer:
                         if self.flog:
                             self.flog.log_step(
                                 self.iter_num, config.max_iters, avg_loss, lr,
-                                avg_gn, tok_sec, vram_alloc, eta_str,
+                                avg_gn, tok_sec, tokens=self._tokens_processed,
                             )
 
                 # ── Evaluation ───────────────────────────────────────────
