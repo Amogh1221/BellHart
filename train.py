@@ -311,7 +311,7 @@ def _train_worker(index_or_token=None, hf_token=None):
             config.compile = False
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
-            config.save_interval = 100
+            config.save_interval = 25
         else:                   # T4 16GB / RTX 3060 etc.
             new_batch = 1
             config.compile = False
