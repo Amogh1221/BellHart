@@ -429,8 +429,8 @@ class GPT(nn.Module):
                 )
                 print("  Using bitsandbytes AdamW8bit optimizer (Non-Paged)")
                 return optimizer
-            except ImportError:
-                print("  bitsandbytes not available, falling back to standard AdamW")
+            except Exception as e:
+                print(f"  bitsandbytes not available ({e}), falling back to standard AdamW")
 
         # Standard AdamW
         import inspect

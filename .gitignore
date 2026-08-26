@@ -35,7 +35,7 @@ checkpoints/
 runs/
 logs/
 samples/
-training_log.txt
+training_log*.txt
 
 # OS generated files
 .DS_Store

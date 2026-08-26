@@ -237,22 +237,34 @@ def _train_worker(index_or_token=None, hf_token=None):
         os.environ["HF_TOKEN"] = hf_token
 
     config_path = "config.json"
-    if os.path.exists(config_path):
-        if is_master:
+    if is_master:
+        if os.path.exists(config_path):
             print(f"Loading config from {config_path}")
-        with open(config_path) as f:
             config = GPTConfig.load(config_path)
+        else:
+            config = GPTConfig()
+            config.save("config.json")
+            print(f"Created default config at {config_path}")
     else:
         config = GPTConfig()
-        config.save("config.json")
-        if is_master:
-            print(f"Created default config at {config_path}")
+
+    # Synchronize config creation across DDP workers
+    if is_ddp and not USE_TPU:
+        import torch.distributed as dist
+        dist.barrier()
+        if not is_master and os.path.exists(config_path):
+            config = GPTConfig.load(config_path)
 
     repo_id = config.hf_repo
 
     # Only master downloads data (avoid concurrent downloads)
     if is_master:
         sync_huggingface(repo_id)
+
+    # Wait for master to finish downloading checkpoints and dataset files
+    if is_ddp and not USE_TPU:
+        import torch.distributed as dist
+        dist.barrier()
 
 
     # ── Auto-detect device and adjust config ─────────────────────────────
@@ -400,6 +412,12 @@ def _train_worker(index_or_token=None, hf_token=None):
             trainer.save_checkpoint(ckpt_path, step_num=trainer.iter_num)
             print(f"Checkpoint saved to {ckpt_path}. Exiting.")
         sys.exit(0)
+    except Exception as e:
+        import traceback
+        rank_str = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+        print(f"\n[CRITICAL ERROR on Rank {rank_str}] {e}\n", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
 
 
 def run_notebook(hf_token: str = ""):
