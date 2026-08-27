@@ -30,14 +30,14 @@ class GPTConfig:
     # ── Training ────────────────────────────────────────────────────────
     batch_size: int = 1
     gradient_accumulation_steps: int = 40
-    max_iters: int = 100000
+    max_iters: int = 150000
     learning_rate: float = 5e-4
     weight_decay: float = 0.1
     beta1: float = 0.90
     beta2: float = 0.95
     lr_schedule: str = "cosine"      # "cosine" or "wsd" (Warmup-Stable-Decay)
     warmup_iters: int = 3000
-    lr_decay_iters: int = 100000     # For continuous cosine decay
+    lr_decay_iters: int = 150000     # For continuous cosine decay
     decay_iters: int = 15000         # For WSD schedule decay phase duration
     min_lr: float = 5e-5
     eval_interval: int = 200
