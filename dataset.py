@@ -149,6 +149,7 @@ class HFStreamingDataset(IterableDataset):
                         self.chunks_yielded += 1
                         x = torch.tensor(chunk[:-1], dtype=torch.long)
                         y = torch.tensor(chunk[1:], dtype=torch.long)
+                        del chunk
                         yield x, y
 
                 # If stream finishes normally, advance epoch and continue seamlessly

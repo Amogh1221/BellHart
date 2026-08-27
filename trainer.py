@@ -271,7 +271,7 @@ class Trainer:
         self.val_dataset = getattr(val_loader, "dataset", None)
 
         self.train_iter = iter(self.train_loader)
-        self.val_iter = iter(self.val_loader) if val_loader is not None else None
+        self.val_iter = None  # Lazy-initialized during eval to save host RAM
 
         self.iter_num = 0
         self.best_val_loss = float("inf")
@@ -283,8 +283,14 @@ class Trainer:
         self._tokens_processed = 0
         self._last_log_time = None
 
+        # Clean host CPU memory after full initialization
+        import gc
+        gc.collect()
+
     def get_batch(self, split="train"):
-        if split == "val" and self.val_iter is not None:
+        if split == "val" and self.val_loader is not None:
+            if self.val_iter is None:
+                self.val_iter = iter(self.val_loader)
             loader_iter = self.val_iter
             raw_loader = self.val_loader
         else:
@@ -310,7 +316,11 @@ class Trainer:
         eval_steps = min(max(self.config.eval_iters, 5), 20)
 
         # Estimate validation loss on dedicated validation stream
-        for split in (["train", "val"] if self.val_iter is not None else ["train"]):
+        splits = ["train"]
+        if self.val_loader is not None:
+            splits.append("val")
+
+        for split in splits:
             total_loss = 0.0
             for k in range(eval_steps):
                 x, y = self.get_batch(split)
@@ -332,16 +342,14 @@ class Trainer:
         if "val" not in out:
             out["val"] = out["train"]
 
+        # Reset val_iter to free stream buffers after evaluation
+        self.val_iter = None
+
         self.model.train()
         import gc
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        try:
-            import ctypes
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
         return out
 
     def save_checkpoint(self, path, step_num=None, max_ckpt=3, epoch_name=None):
