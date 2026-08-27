@@ -329,6 +329,7 @@ def _train_worker(index_or_token=None, hf_token=None):
             config.compile = False
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
+            config.block_size = 2048  # Halve context to fit in 16GB VRAM + limited system RAM
 
         # Set eval_iters reasonably to prevent streaming buffer explosion
         base_eval_batches = 20
