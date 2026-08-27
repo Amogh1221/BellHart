@@ -669,12 +669,6 @@ class Trainer:
             # Free activations and batch tensors immediately before next micro-step
             del logits, loss, x, y
 
-            try:
-                import ctypes
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except Exception:
-                pass
-
             self.micro_step += 1
             if pbar:
                 micro = self.micro_step % config.gradient_accumulation_steps
@@ -723,14 +717,10 @@ class Trainer:
                 self._grad_norm_count += 1
                 self._tokens_processed += tokens_per_step
 
-                # Periodic host RAM cleanup to prevent OOM killer on cloud VMs
-                import gc
-                gc.collect()
-                try:
-                    import ctypes
-                    ctypes.CDLL("libc.so.6").malloc_trim(0)
-                except Exception:
-                    pass
+                # Periodic cleanup only once every 500 steps to avoid CPU stalling
+                if self.iter_num % 500 == 0 and self.iter_num > 0:
+                    import gc
+                    gc.collect()
 
                 # ── Per-step terminal + file log (master only) ───────────
                 if self.iter_num % config.log_interval == 0 and self.iter_num > 0:
