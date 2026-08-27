@@ -97,7 +97,7 @@ class GPTConfig:
     min_lr: float = 5e-5
     """Minimum learning rate floor at the end of the decay schedule (10% of peak LR)."""
 
-    eval_interval: int = 200
+    eval_interval: int = 500
     """Step interval for computing validation loss and generating structured eval reports."""
 
     eval_iters: int = 20
@@ -106,7 +106,7 @@ class GPTConfig:
     log_interval: int = 1
     """Step interval for updating terminal progress, TensorBoard metrics, and file logs."""
 
-    save_interval: int = 20
+    save_interval: int = 25
     """Step interval for saving local checkpoints and triggering asynchronous HuggingFace backups."""
 
     gen_interval: int = 5000

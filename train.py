@@ -222,18 +222,19 @@ def _train_worker(hf_token: str = ""):
 
         # Standardize pre-training context length to 2048 tokens
         config.block_size = 2048
+        config.eval_interval = 500  # Evaluate every 500th step
 
         # Tiered scaling based on hardware capacity
         if vram_gb >= 70:       # NVIDIA H100 80GB / A100 80GB
             new_batch = 8
             config.compile = False
             config.gradient_checkpointing = 1
-            config.save_interval = 400
+            config.save_interval = 200
         elif vram_gb >= 35:     # NVIDIA A100 40GB
             new_batch = 4
             config.compile = False
             config.gradient_checkpointing = 1
-            config.save_interval = 200
+            config.save_interval = 100
         elif vram_gb >= 20:     # NVIDIA L4 / RTX 3090 / RTX 4090 (24GB)
             new_batch = 2
             config.compile = False
@@ -245,6 +246,7 @@ def _train_worker(hf_token: str = ""):
             config.compile = False
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
+            config.save_interval = 25
 
         base_eval_batches = 20
         config.eval_iters = max(5, base_eval_batches // new_batch)
