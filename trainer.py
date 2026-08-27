@@ -58,13 +58,27 @@ _DTYPE_MAP = {
 
 
 def get_lr(it, config: GPTConfig):
+    # Warmup phase (linear ramp)
     if it < config.warmup_iters:
         return config.learning_rate * (it + 1) / (config.warmup_iters + 1)
+
+    schedule = getattr(config, "lr_schedule", "cosine")
+    if schedule == "wsd":
+        # WSD: Warmup -> Stable (at peak LR) -> Rapid Cosine Decay
+        decay_iters = getattr(config, "decay_iters", 15000)
+        decay_start = max(config.warmup_iters, config.max_iters - decay_iters)
+        if it < decay_start:
+            return config.learning_rate  # Stable phase at peak LR
+        if it >= config.max_iters:
+            return config.min_lr
+        decay_ratio = (it - decay_start) / max(1, config.max_iters - decay_start)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return config.min_lr + coeff * (config.learning_rate - config.min_lr)
+
+    # Default continuous Cosine decay
     if it > config.lr_decay_iters:
         return config.min_lr
-    decay_ratio = (it - config.warmup_iters) / (
-        config.lr_decay_iters - config.warmup_iters
-    )
+    decay_ratio = (it - config.warmup_iters) / max(1, config.lr_decay_iters - config.warmup_iters)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return config.min_lr + coeff * (config.learning_rate - config.min_lr)
 
@@ -181,10 +195,7 @@ class FileLogger:
         hr = "═" * 56
         self.write(f"\n{hr}")
         self.write(f"  TRAINING STARTED — {self._ts()}")
-        self.write(f"{hr}")
         self.write(f"  Model params    : {n_params:,}")
-        for k, v in asdict(config).items():
-            self.write(f"  {k:<28s}: {v}")
         self.write(hr)
 
     def log_end(self, step, elapsed, best_val):
@@ -268,13 +279,24 @@ class Trainer:
             "cuda", enabled=self.use_scaler
         ) if not self.use_tpu else None
 
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.train_dataset = getattr(train_loader, "dataset", None)
+        self.val_dataset = getattr(val_loader, "dataset", None)
+
         if self.use_tpu:
             import torch_xla.distributed.parallel_loader as pl
             self.train_device_loader = pl.MpDeviceLoader(train_loader, self.device)
             self.train_iter = iter(self.train_device_loader)
+            if val_loader:
+                self.val_device_loader = pl.MpDeviceLoader(val_loader, self.device)
+                self.val_iter = iter(self.val_device_loader)
+            else:
+                self.val_device_loader = None
+                self.val_iter = None
         else:
-            self.train_loader = train_loader
             self.train_iter = iter(self.train_loader)
+            self.val_iter = iter(self.val_loader) if val_loader else None
 
         self.iter_num = 0
         self.best_val_loss = float("inf")
@@ -287,14 +309,28 @@ class Trainer:
         self._last_log_time = None
 
     def get_batch(self, split="train"):
+        if split == "val" and self.val_iter is not None:
+            loader_iter = self.val_iter
+            device_loader = getattr(self, "val_device_loader", None)
+            raw_loader = self.val_loader
+        else:
+            loader_iter = self.train_iter
+            device_loader = getattr(self, "train_device_loader", None)
+            raw_loader = self.train_loader
+
         try:
-            x, y = next(self.train_iter)
+            x, y = next(loader_iter)
         except StopIteration:
             if self.use_tpu:
-                self.train_iter = iter(self.train_device_loader)
+                loader_iter = iter(device_loader)
             else:
-                self.train_iter = iter(self.train_loader)
-            x, y = next(self.train_iter)
+                loader_iter = iter(raw_loader)
+
+            if split == "val":
+                self.val_iter = loader_iter
+            else:
+                self.train_iter = loader_iter
+            x, y = next(loader_iter)
 
         if self.use_tpu:
             return x, y
@@ -307,32 +343,34 @@ class Trainer:
         out = {}
         self.model.eval()
         eval_steps = min(max(self.config.eval_iters, 5), 20)
-        total_loss = 0.0
-        for k in range(eval_steps):
-            x, y = self.get_batch("train")
-            if self.use_tpu:
-                # On TPU, bfloat16 is handled natively via XLA_USE_BF16
-                logits, _ = self.model(x)
-            else:
-                with torch.amp.autocast(
-                    "cuda",
-                    dtype=_DTYPE_MAP.get(self.config.dtype, torch.float16),
-                    enabled=self.config.dtype != "float32",
-                ):
-                    logits, _ = self.model(x)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                y.view(-1),
-            )
-            total_loss += loss.item()
-            del logits, loss, x, y
-            if self.use_tpu:
-                import torch_xla.core.xla_model as xm
-                xm.mark_step()
 
-        avg_loss = total_loss / max(eval_steps, 1)
-        out["train"] = avg_loss
-        out["val"] = avg_loss
+        # Estimate validation loss on dedicated validation stream
+        for split in (["train", "val"] if self.val_iter is not None else ["train"]):
+            total_loss = 0.0
+            for k in range(eval_steps):
+                x, y = self.get_batch(split)
+                if self.use_tpu:
+                    logits, _ = self.model(x)
+                else:
+                    with torch.amp.autocast(
+                        "cuda",
+                        dtype=_DTYPE_MAP.get(self.config.dtype, torch.float16),
+                        enabled=self.config.dtype != "float32",
+                    ):
+                        logits, _ = self.model(x)
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    y.view(-1),
+                )
+                total_loss += loss.item()
+                del logits, loss, x, y
+                if self.use_tpu:
+                    xm.mark_step()
+
+            out[split] = total_loss / max(eval_steps, 1)
+
+        if "val" not in out:
+            out["val"] = out["train"]
 
         self.model.train()
         if not self.use_tpu:
@@ -349,13 +387,39 @@ class Trainer:
 
     def save_checkpoint(self, path, step_num=None, max_ckpt=3, epoch_name=None):
         model_state = self.model.module.state_dict() if hasattr(self.model, "module") else self.model.state_dict()
+        
+        # Save dataset streaming state
+        dataset_state = None
+        if getattr(self, "train_dataset", None) is not None and hasattr(self.train_dataset, "state_dict"):
+            try:
+                dataset_state = self.train_dataset.state_dict()
+            except Exception as e:
+                pass
+
+        # In DDP, gather dataset states across all ranks so each GPU's stream position is saved
+        dataset_states = None
+        if self.is_ddp and not self.use_tpu:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                try:
+                    world_size = dist.get_world_size()
+                    gathered = [None for _ in range(world_size)]
+                    dist.all_gather_object(gathered, dataset_state)
+                    dataset_states = gathered
+                except Exception:
+                    pass
+
         ckpt = {
             "model_state_dict": model_state,
             "optimizer_state_dict": self.optimizer.state_dict(),
             "iter_num": self.iter_num,
             "best_val_loss": self.best_val_loss,
             "config": self.config,
+            "dataset_state": dataset_state,
         }
+        if dataset_states is not None:
+            ckpt["dataset_states"] = dataset_states
+
         if getattr(self, "ema", None) is not None:
             ckpt["ema"] = self.ema.state_dict()
         if getattr(self, "use_scaler", False) and getattr(self, "scaler", None) is not None:
@@ -520,6 +584,35 @@ class Trainer:
             }
         if self.use_scaler and self.scaler is not None and "scaler" in ckpt:
             self.scaler.load_state_dict(ckpt["scaler"])
+
+        # ── Restore Dataset Streaming State ──────────────────────────────
+        if getattr(self, "train_dataset", None) is not None and hasattr(self.train_dataset, "load_state_dict"):
+            local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+            ds_state = None
+            if "dataset_states" in ckpt and isinstance(ckpt["dataset_states"], list) and len(ckpt["dataset_states"]) > local_rank:
+                ds_state = ckpt["dataset_states"][local_rank]
+            elif "dataset_state" in ckpt:
+                ds_state = ckpt["dataset_state"]
+
+            if ds_state is not None:
+                self.train_dataset.load_state_dict(ds_state)
+                if self.is_master:
+                    print(f"Restored streaming dataset state (chunks yielded: {ds_state.get('chunks_yielded', 'N/A')}, epoch: {ds_state.get('epoch', 0)})")
+            else:
+                # Fallback for legacy checkpoints saved without dataset_state
+                if self.iter_num > 0 and self.is_master:
+                    print(f"Note: Checkpoint from step {self.iter_num} has no saved dataset state. Shifting seed to avoid duplicate data replay.")
+                    if hasattr(self.train_dataset, "seed"):
+                        self.train_dataset.seed += (self.iter_num // 1000 + 1)
+
+            # Re-initialize the training iterator to apply restored stream state
+            if self.use_tpu:
+                import torch_xla.distributed.parallel_loader as pl
+                self.train_device_loader = pl.MpDeviceLoader(self.train_loader, self.device)
+                self.train_iter = iter(self.train_device_loader)
+            else:
+                self.train_iter = iter(self.train_loader)
+
         del ckpt
         import gc
         gc.collect()

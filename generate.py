@@ -11,8 +11,7 @@ from tokenizer import Tokenizer
 def main():
     config_path = "config.json"
     if os.path.exists(config_path):
-        with open(config_path) as f:
-            config = GPTConfig(**json.load(f))
+        config = GPTConfig.load(config_path)
     else:
         config = GPTConfig()
         print("No config.json found, using default config")

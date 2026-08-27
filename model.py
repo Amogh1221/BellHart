@@ -120,18 +120,31 @@ class GroupedQueryAttention(nn.Module):
         self.v_proj = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=False)
         self.o_proj = nn.Linear(config.n_head * self.head_dim, config.n_embd, bias=False)
 
+        # QK-Norm: RMSNorm on Query and Key heads to prevent entropy collapse in deep models
+        self.q_norm = RMSNorm(self.head_dim, eps=config.norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.norm_eps)
+
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x, rope_cos, rope_sin, layer_past=None):
+    def forward(self, x, rope_cos, rope_sin, layer_past=None, v_prev=None):
         B, T, C = x.shape
 
         # Project to Q, K, V
-        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim)
+        k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
-        # Apply RoPE to Q and K
+        # Value-Residual: retain current unmixed V for the next block, then blend with previous V
+        v_cur = v
+        if v_prev is not None:
+            v = 0.5 * v + 0.5 * v_prev
+
+        # Apply QK-Norm per head dimension, then transpose to (B, n_head, T, head_dim)
+        q = self.q_norm(q).transpose(1, 2)
+        k = self.k_norm(k).transpose(1, 2)
+
+        # Apply RoPE to normalized Q and K
         q, k = apply_rotary_pos_emb(q, k, rope_cos, rope_sin)
 
         # KV cache for inference
@@ -142,21 +155,25 @@ class GroupedQueryAttention(nn.Module):
 
         present = (k.detach(), v.detach())
 
-        # Expand KV heads to match Q heads via non-allocating view expansion
-        if self.n_rep > 1:
-            k = k[:, :, None, :, :].expand(B, self.n_kv_head, self.n_rep, k.size(2), self.head_dim).reshape(B, self.n_head, k.size(2), self.head_dim)
-            v = v[:, :, None, :, :].expand(B, self.n_kv_head, self.n_rep, v.size(2), self.head_dim).reshape(B, self.n_head, v.size(2), self.head_dim)
-
-        # Scaled dot-product attention (dispatches to FlashAttention when available)
+        # Scaled dot-product attention (dispatches to native FlashAttention GQA)
         is_causal = T > 1 and layer_past is None
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        if self.n_rep > 1:
+            try:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, enable_gqa=True)
+            except (TypeError, RuntimeError):
+                # Fallback for environments without native enable_gqa support
+                k_exp = k[:, :, None, :, :].expand(B, self.n_kv_head, self.n_rep, k.size(2), self.head_dim).reshape(B, self.n_head, k.size(2), self.head_dim)
+                v_exp = v[:, :, None, :, :].expand(B, self.n_kv_head, self.n_rep, v.size(2), self.head_dim).reshape(B, self.n_head, v.size(2), self.head_dim)
+                y = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=is_causal)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
         # Reshape and project output
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.o_proj(y)
         y = self.resid_dropout(y)
 
-        return y, present
+        return y, present, v_cur
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -195,7 +212,7 @@ class Block(nn.Module):
     """Transformer decoder block with pre-norm residual connections.
 
     Structure:
-        x → RMSNorm → GQA+RoPE → + residual → RMSNorm → SwiGLU → + residual
+        x → RMSNorm → GQA+RoPE+Res-V → + residual → RMSNorm → SwiGLU → + residual
     """
 
     def __init__(self, config: GPTConfig):
@@ -205,17 +222,17 @@ class Block(nn.Module):
         self.ln_2 = RMSNorm(config.n_embd, eps=config.norm_eps)
         self.mlp = SwiGLU(config)
 
-    def forward(self, x, rope_cos, rope_sin, layer_past=None):
-        attn_out, present = self.attn(self.ln_1(x), rope_cos, rope_sin, layer_past)
+    def forward(self, x, rope_cos, rope_sin, layer_past=None, v_prev=None):
+        attn_out, present, v_cur = self.attn(self.ln_1(x), rope_cos, rope_sin, layer_past, v_prev=v_prev)
         x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x, present
+        return x, present, v_cur
 
-    def forward_checkpoint(self, x, rope_cos, rope_sin):
-        attn_out, _ = self.attn(self.ln_1(x), rope_cos, rope_sin, None)
+    def forward_checkpoint(self, x, rope_cos, rope_sin, v_prev=None):
+        attn_out, _, v_cur = self.attn(self.ln_1(x), rope_cos, rope_sin, None, v_prev=v_prev)
         x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, v_cur
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -224,7 +241,7 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    """BellHart — Llama-style GPT with GQA, RoPE, SwiGLU, RMSNorm.
+    """BellHart — Llama-style GPT with GQA, RoPE, SwiGLU, RMSNorm, QK-Norm, Res-V, U-Net Skips.
 
     No absolute position embeddings. Positions are encoded via RoPE
     directly inside the attention mechanism.
@@ -252,23 +269,28 @@ class GPT(nn.Module):
             theta=config.rope_theta,
         )
 
-        # Initialize weights
+        # Initialize weights with fan-in variance scaling
         self.apply(self._init_weights)
 
-        # Depth-scaled initialization for output projections
-        # Prevents residual signal explosion in deep networks
-        output_std = 0.02 / math.sqrt(2 * config.n_layer)
+        # Depth-scaled initialization for residual output projections
+        # Prevents activation variance explosion across deep networks
         for block in self.h:
-            torch.nn.init.normal_(block.attn.o_proj.weight, mean=0.0, std=output_std)
-            torch.nn.init.normal_(block.mlp.down_proj.weight, mean=0.0, std=output_std)
+            fan_in_attn = block.attn.o_proj.weight.size(1)
+            fan_in_mlp = block.mlp.down_proj.weight.size(1)
+            std_attn = 1.0 / math.sqrt(2 * config.n_layer * fan_in_attn)
+            std_mlp = 1.0 / math.sqrt(2 * config.n_layer * fan_in_mlp)
+            torch.nn.init.normal_(block.attn.o_proj.weight, mean=0.0, std=std_attn)
+            torch.nn.init.normal_(block.mlp.down_proj.weight, mean=0.0, std=std_mlp)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            fan_in = module.weight.size(1)
+            std = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0.02
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=1.0 / math.sqrt(module.embedding_dim))
 
     def forward(self, idx, past_key_values=None, use_cache=False):
         B, T = idx.shape
@@ -286,34 +308,50 @@ class GPT(nn.Module):
 
         rope_cos, rope_sin = self.rope(T, offset=offset)
 
-        # Token embeddings (no position embeddings — RoPE handles positions)
-        x = self.drop(self.wte(idx))
+        # Token embeddings scaled by sqrt(d_model) (Gemma 2 / PaLM tied-embedding stabilization)
+        x = self.drop(self.wte(idx) * math.sqrt(self.config.n_embd))
 
         presents = [] if use_cache else None
+        shortcuts = []
+        mid = self.config.n_layer // 2
+        v_prev = None
 
         for i, block in enumerate(self.h):
             layer_past = None
             if past_key_values is not None and i < len(past_key_values):
                 layer_past = past_key_values[i]
 
+            # U-Net long-range skip connection (Meta MobileLLM ICML 2024)
+            if i < mid:
+                shortcuts.append(x)
+            else:
+                x = x + shortcuts[self.config.n_layer - 1 - i]
+
             ckpt = self.config.gradient_checkpointing
             if self.training and ckpt > 0 and (i % ckpt == 0):
                 if x.device.type == "xla":
                     import torch_xla.utils.checkpoint as xla_ckpt
-                    x = xla_ckpt.checkpoint(block.forward_checkpoint, x, rope_cos, rope_sin)
+                    x, v_cur = xla_ckpt.checkpoint(block.forward_checkpoint, x, rope_cos, rope_sin, v_prev)
                 else:
-                    x = torch.utils.checkpoint.checkpoint(
-                        block.forward_checkpoint, x, rope_cos, rope_sin, use_reentrant=True
+                    x, v_cur = torch.utils.checkpoint.checkpoint(
+                        block.forward_checkpoint, x, rope_cos, rope_sin, v_prev, use_reentrant=False
                     )
                 present = None
             else:
-                x, present = block(x, rope_cos, rope_sin, layer_past)
+                x, present, v_cur = block(x, rope_cos, rope_sin, layer_past, v_prev=v_prev)
+
+            v_prev = v_cur
 
             if use_cache:
                 presents.append(present)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
+
+        # Logit Soft-Capping (Gemma 2 style)
+        soft_cap = getattr(self.config, "logit_soft_cap", 0.0)
+        if soft_cap > 0.0:
+            logits = soft_cap * torch.tanh(logits / soft_cap)
 
         return logits, presents
 
