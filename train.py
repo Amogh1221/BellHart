@@ -276,7 +276,7 @@ def _train_worker(index_or_token=None, hf_token=None):
         config.grad_clip = 0.0
         # Disabled checkpointing for direct, single-graph execution
         config.gradient_checkpointing = 0
-        config.block_size = 4096
+        config.block_size = 2048  # Pre-train at 2K context; extend to 4K/8K during finetuning
         config.batch_size = 1
         config.gradient_accumulation_steps = 1
         
@@ -307,6 +307,9 @@ def _train_worker(index_or_token=None, hf_token=None):
         # Prevent CUDA memory fragmentation
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+        # Pre-train at 2K context on all tiers; extend to 4K/8K during finetuning via RoPE
+        config.block_size = 2048
+
         # Scale batch_size and optimizations based on available VRAM
         if vram_gb >= 70:       # H100 80GB / A100 80GB
             new_batch = 8
@@ -329,7 +332,6 @@ def _train_worker(index_or_token=None, hf_token=None):
             config.compile = False
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
-            config.block_size = 2048  # Halve context to fit in 16GB VRAM + limited system RAM
 
         # Set eval_iters reasonably to prevent streaming buffer explosion
         base_eval_batches = 20
@@ -358,6 +360,7 @@ def _train_worker(index_or_token=None, hf_token=None):
 
         if is_master:
             print(f"Auto-scaled for {vram_gb:.0f}GB VRAM → "
+                  f"block_size={config.block_size}, "
                   f"batch_size={config.batch_size}, "
                   f"grad_accum={config.gradient_accumulation_steps}, "
                   f"eval_iters={config.eval_iters}, "
@@ -371,6 +374,7 @@ def _train_worker(index_or_token=None, hf_token=None):
     tokenizer = Tokenizer()
     config.vocab_size = tokenizer.vocab_size
 
+    use_pin_memory = (config.device == "cuda")
     train_loader, val_loader = create_streaming_dataloaders(
         dataset_name="openbmb/Ultra-FineWeb-L1",
         dataset_config="CC-MAIN-2025-30",
@@ -378,7 +382,7 @@ def _train_worker(index_or_token=None, hf_token=None):
         block_size=config.block_size,
         batch_size=config.batch_size,
         num_workers=0,
-        pin_memory=False,
+        pin_memory=use_pin_memory,  # Free speedup: page-locked CPU→GPU transfers
         seed=42 + seed_offset,
         rank=global_rank,
         world_size=world_size,
