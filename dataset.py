@@ -113,7 +113,7 @@ class HFStreamingDataset(IterableDataset):
         Main streaming generator loop:
           1. Connects to HuggingFace dataset stream.
           2. Shards stream across DDP ranks.
-          3. Shuffles stream with buffer.
+          3. Shuffles stream with buffer (if buffer_size > 1).
           4. Restores HF checkpoint state if resuming.
           5. Reads documents, encodes tokens, and yields (block_size + 1) chunks.
         """
@@ -141,8 +141,9 @@ class HFStreamingDataset(IterableDataset):
                 if self.world_size > 1:
                     ds = ds.shard(num_shards=self.world_size, index=self.rank)
 
-                # 3. Shuffle stream with specified buffer size
-                ds = ds.shuffle(buffer_size=self.buffer_size, seed=seed)
+                # 3. Shuffle stream only if buffer_size > 1 (sharding across 1000 files provides natural shuffling)
+                if self.buffer_size > 1:
+                    ds = ds.shuffle(buffer_size=self.buffer_size, seed=seed)
 
                 # 4. Restore exact checkpoint stream state if resuming
                 if state_to_restore is not None and state_to_restore.get("hf_state") is not None:
@@ -218,6 +219,7 @@ def create_streaming_dataloaders(
         split="train",
         tokenizer=tokenizer,
         block_size=block_size,
+        buffer_size=1,
         seed=seed,
         config_name=dataset_config,
         rank=rank,
@@ -229,6 +231,7 @@ def create_streaming_dataloaders(
         split="train",
         tokenizer=tokenizer,
         block_size=block_size,
+        buffer_size=1,
         seed=seed + 100_000,
         config_name=dataset_config,
         rank=rank,

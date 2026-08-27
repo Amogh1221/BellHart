@@ -266,8 +266,14 @@ class Trainer:
             self.writer = None
             self.flog = None
 
-        # Instantiate GPT model directly on target compute device
-        self.model = GPT(config).to(self.device)
+        # Instantiate GPT model directly on target compute device to avoid 2.5GB CPU RAM allocation
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
+            with torch.device(self.device):
+                self.model = GPT(config)
+        else:
+            self.model = GPT(config)
+
         self.n_params = sum(p.numel() for p in self.model.parameters())
         if self.is_master:
             print(f"Model parameters: {self.n_params:,}")
@@ -277,13 +283,18 @@ class Trainer:
                 print("Compiling model.forward with PyTorch 2.0+...")
             self.model.forward = torch.compile(self.model.forward, mode="default")
 
-        # Multi-GPU DistributedDataParallel (DDP) wrapping
+        # Multi-GPU DistributedDataParallel (DDP) wrapping with memory-efficient bucket views
         if self.is_ddp:
             if self.is_master:
                 print("Wrapping model with DistributedDataParallel (DDP).")
             from torch.nn.parallel import DistributedDataParallel as DDP
             ddp_local_rank = int(os.environ.get('LOCAL_RANK', 0))
-            self.model = DDP(self.model, device_ids=[ddp_local_rank])
+            self.model = DDP(
+                self.model,
+                device_ids=[ddp_local_rank],
+                gradient_as_bucket_view=True,
+                bucket_cap_mb=25,
+            )
 
         # Create optimizer with separated weight decay parameter groups
         self.optimizer = (self.model.module if self.is_ddp else self.model).configure_optimizers(config)

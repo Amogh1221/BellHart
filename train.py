@@ -35,6 +35,8 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["ACCELERATE_LOG_LEVEL"] = "ERROR"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["ARROW_DEFAULT_MEMORY_POOL"] = "system"
+os.environ["DATASETS_STREAMING_READ_MAX_BATCH_SIZE"] = "50"
 logging.getLogger("torch.distributed").setLevel(logging.ERROR)
 logging.getLogger("torch.distributed.elastic").setLevel(logging.ERROR)
 logging.getLogger("accelerate").setLevel(logging.ERROR)
