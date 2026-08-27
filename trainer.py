@@ -288,7 +288,7 @@ class Trainer:
             import torch_xla.distributed.parallel_loader as pl
             self.train_device_loader = pl.MpDeviceLoader(train_loader, self.device)
             self.train_iter = iter(self.train_device_loader)
-            if val_loader:
+            if val_loader is not None:
                 self.val_device_loader = pl.MpDeviceLoader(val_loader, self.device)
                 self.val_iter = iter(self.val_device_loader)
             else:
@@ -296,7 +296,7 @@ class Trainer:
                 self.val_iter = None
         else:
             self.train_iter = iter(self.train_loader)
-            self.val_iter = iter(self.val_loader) if val_loader else None
+            self.val_iter = iter(self.val_loader) if val_loader is not None else None
 
         self.iter_num = 0
         self.best_val_loss = float("inf")
