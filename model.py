@@ -329,13 +329,9 @@ class GPT(nn.Module):
 
             ckpt = self.config.gradient_checkpointing
             if self.training and ckpt > 0 and (i % ckpt == 0):
-                if x.device.type == "xla":
-                    import torch_xla.utils.checkpoint as xla_ckpt
-                    x, v_cur = xla_ckpt.checkpoint(block.forward_checkpoint, x, rope_cos, rope_sin, v_prev)
-                else:
-                    x, v_cur = torch.utils.checkpoint.checkpoint(
-                        block.forward_checkpoint, x, rope_cos, rope_sin, v_prev, use_reentrant=False
-                    )
+                x, v_cur = torch.utils.checkpoint.checkpoint(
+                    block.forward_checkpoint, x, rope_cos, rope_sin, v_prev, use_reentrant=False
+                )
                 present = None
             else:
                 x, present, v_cur = block(x, rope_cos, rope_sin, layer_past, v_prev=v_prev)
@@ -404,10 +400,6 @@ class GPT(nn.Module):
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
-
-            if idx.device.type == "xla":
-                import torch_xla.core.xla_model as xm
-                xm.mark_step()
 
         return idx
 

@@ -13,5 +13,3 @@ zstandard
 safetensors
 bitsandbytes
 huggingface_hub
-# TPU support (pre-installed on Kaggle TPU environments, skip on GPU)
-# torch_xla

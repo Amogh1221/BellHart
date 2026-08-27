@@ -112,7 +112,7 @@ class HFStreamingDataset(IterableDataset):
                 else:
                     ds = load_fn(self.dataset_name, split=self.split, streaming=True)
 
-                # 2. Shard across GPUs / TPU cores so each rank gets independent data
+                # 2. Shard across GPU ranks so each worker gets independent data
                 if self.world_size > 1:
                     ds = ds.shard(num_shards=self.world_size, index=self.rank)
 

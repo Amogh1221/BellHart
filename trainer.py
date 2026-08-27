@@ -1,14 +1,14 @@
 """
-trainer.py  —  nano_brain training loop (TPU + GPU dual-compatible)
-===================================================================
+trainer.py  —  BellHart GPU Training Pipeline (Single GPU & Multi-GPU DDP)
+===========================================================================
 Full-featured trainer with:
-  - Dual TPU (torch_xla) and GPU (CUDA) support
-  - Mixed-precision: native bfloat16 on TPU, AMP on GPU
+  - GPU (CUDA) and Multi-GPU DistributedDataParallel (DDP) support
+  - Mixed-precision: bfloat16 / float16 with AMP GradScaler
   - Gradient accumulation for large effective batch sizes
   - Gradient clipping with norm tracking
   - EMA (exponential moving average) of model weights
-  - Cosine LR schedule with warmup
-  - Checkpointing (latest + best by val loss)
+  - Cosine & WSD (Warmup-Stable-Decay) LR schedules
+  - Checkpointing (latest + best by val loss) with async HuggingFace backup
   - TensorBoard logging
   - Rich terminal output (loss, grad_norm, tok/s, VRAM, ETA)
   - Persistent file logging to logs/training_log.txt
@@ -36,11 +36,6 @@ from huggingface_hub.utils import disable_progress_bars
 from config import GPTConfig
 from model import GPT, EMA
 
-
-import importlib.util
-
-# ── TPU Detection ────────────────────────────────────────────────────────────
-USE_TPU = importlib.util.find_spec("torch_xla") is not None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Dtype mapping
@@ -123,13 +118,6 @@ def _vram_gb() -> tuple[float, float]:
 
 def _is_master() -> bool:
     """Returns True if this process is the master (should do logging, saving, etc.)."""
-    if USE_TPU:
-        try:
-            import torch_xla.runtime as xr
-            return xr.global_ordinal() == 0
-        except (ImportError, AttributeError):
-            import torch_xla.core.xla_model as xm
-            return xm.is_master_ordinal(local=False)
     return int(os.environ.get('RANK', 0)) == 0
 
 
@@ -221,19 +209,18 @@ class Trainer:
     def __init__(self, config: GPTConfig, tokenizer, train_loader, val_loader, is_ddp=False):
         self.config = config
         self.tokenizer = tokenizer
-        self.use_tpu = (config.device == "xla")
+        self.is_ddp = is_ddp
 
         # Set device
-        if self.use_tpu:
-            import torch_xla
-            self.device = torch_xla.device()
-            self.is_master = _is_master()
-        elif is_ddp:
-            ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        if is_ddp:
+            ddp_local_rank = int(os.environ.get('LOCAL_RANK', 0))
             self.device = torch.device(f"cuda:{ddp_local_rank}")
-            self.is_master = (int(os.environ['RANK']) == 0)
+            self.is_master = (int(os.environ.get('RANK', 0)) == 0)
+        elif config.device == "cuda" and torch.cuda.is_available():
+            self.device = torch.device("cuda:0")
+            self.is_master = True
         else:
-            self.device = torch.device(config.device)
+            self.device = torch.device("cpu")
             self.is_master = True
 
         os.makedirs("checkpoints", exist_ok=True)
@@ -255,48 +242,36 @@ class Trainer:
 
         if config.compile and hasattr(torch, "compile"):
             if self.is_master:
-                print("Compiling model.forward (regional)...")
+                print("Compiling model.forward...")
             self.model.forward = torch.compile(self.model.forward, mode="default")
 
-        # Multi-device wrapping (GPU only; TPU handles multi-core via xm.optimizer_step)
-        self.is_ddp = is_ddp
-        if self.is_ddp and not self.use_tpu:
+        # Multi-device wrapping (GPU DDP)
+        if self.is_ddp:
             if self.is_master:
-                print(f"Wrapping model with DistributedDataParallel (DDP).")
+                print("Wrapping model with DistributedDataParallel (DDP).")
             from torch.nn.parallel import DistributedDataParallel as DDP
             ddp_local_rank = int(os.environ.get('LOCAL_RANK', 0))
             self.model = DDP(self.model, device_ids=[ddp_local_rank])
 
-        self.optimizer = (self.model.module if (self.is_ddp and not self.use_tpu) else self.model).configure_optimizers(config)
+        self.optimizer = (self.model.module if self.is_ddp else self.model).configure_optimizers(config)
 
         self.ema = (
-            EMA(self.model.module if (self.is_ddp and not self.use_tpu) else self.model, decay=config.ema_decay) if config.use_ema else None
+            EMA(self.model.module if self.is_ddp else self.model, decay=config.ema_decay) if config.use_ema else None
         )
 
-        # GradScaler only needed for float16 on GPU
-        self.use_scaler = (not self.use_tpu and config.dtype == "float16")
+        # GradScaler for float16 AMP on GPU
+        self.use_scaler = (self.device.type == "cuda" and config.dtype == "float16")
         self.scaler = torch.amp.GradScaler(
             "cuda", enabled=self.use_scaler
-        ) if not self.use_tpu else None
+        ) if self.device.type == "cuda" else None
 
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.train_dataset = getattr(train_loader, "dataset", None)
         self.val_dataset = getattr(val_loader, "dataset", None)
 
-        if self.use_tpu:
-            import torch_xla.distributed.parallel_loader as pl
-            self.train_device_loader = pl.MpDeviceLoader(train_loader, self.device)
-            self.train_iter = iter(self.train_device_loader)
-            if val_loader is not None:
-                self.val_device_loader = pl.MpDeviceLoader(val_loader, self.device)
-                self.val_iter = iter(self.val_device_loader)
-            else:
-                self.val_device_loader = None
-                self.val_iter = None
-        else:
-            self.train_iter = iter(self.train_loader)
-            self.val_iter = iter(self.val_loader) if val_loader is not None else None
+        self.train_iter = iter(self.train_loader)
+        self.val_iter = iter(self.val_loader) if val_loader is not None else None
 
         self.iter_num = 0
         self.best_val_loss = float("inf")
@@ -311,35 +286,25 @@ class Trainer:
     def get_batch(self, split="train"):
         if split == "val" and self.val_iter is not None:
             loader_iter = self.val_iter
-            device_loader = getattr(self, "val_device_loader", None)
             raw_loader = self.val_loader
         else:
             loader_iter = self.train_iter
-            device_loader = getattr(self, "train_device_loader", None)
             raw_loader = self.train_loader
 
         try:
             x, y = next(loader_iter)
         except StopIteration:
-            if self.use_tpu:
-                loader_iter = iter(device_loader)
-            else:
-                loader_iter = iter(raw_loader)
-
+            loader_iter = iter(raw_loader)
             if split == "val":
                 self.val_iter = loader_iter
             else:
                 self.train_iter = loader_iter
             x, y = next(loader_iter)
 
-        if self.use_tpu:
-            return x, y
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
     @torch.no_grad()
     def estimate_loss(self):
-        if getattr(self, "use_tpu", False):
-            import torch_xla.core.xla_model as xm
         out = {}
         self.model.eval()
         eval_steps = min(max(self.config.eval_iters, 5), 20)
@@ -349,23 +314,18 @@ class Trainer:
             total_loss = 0.0
             for k in range(eval_steps):
                 x, y = self.get_batch(split)
-                if self.use_tpu:
+                with torch.amp.autocast(
+                    "cuda",
+                    dtype=_DTYPE_MAP.get(self.config.dtype, torch.float16),
+                    enabled=(self.device.type == "cuda" and self.config.dtype != "float32"),
+                ):
                     logits, _ = self.model(x)
-                else:
-                    with torch.amp.autocast(
-                        "cuda",
-                        dtype=_DTYPE_MAP.get(self.config.dtype, torch.float16),
-                        enabled=self.config.dtype != "float32",
-                    ):
-                        logits, _ = self.model(x)
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     y.view(-1),
                 )
                 total_loss += loss.item()
                 del logits, loss, x, y
-                if self.use_tpu:
-                    xm.mark_step()
 
             out[split] = total_loss / max(eval_steps, 1)
 
@@ -373,16 +333,15 @@ class Trainer:
             out["val"] = out["train"]
 
         self.model.train()
-        if not self.use_tpu:
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            try:
-                import ctypes
-                ctypes.CDLL("libc.so.6").malloc_trim(0)
-            except Exception:
-                pass
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
         return out
 
     def save_checkpoint(self, path, step_num=None, max_ckpt=3, epoch_name=None):
@@ -393,12 +352,12 @@ class Trainer:
         if getattr(self, "train_dataset", None) is not None and hasattr(self.train_dataset, "state_dict"):
             try:
                 dataset_state = self.train_dataset.state_dict()
-            except Exception as e:
+            except Exception:
                 pass
 
         # In DDP, gather dataset states across all ranks so each GPU's stream position is saved
         dataset_states = None
-        if self.is_ddp and not self.use_tpu:
+        if self.is_ddp:
             import torch.distributed as dist
             if dist.is_initialized():
                 try:
@@ -425,12 +384,8 @@ class Trainer:
         if getattr(self, "use_scaler", False) and getattr(self, "scaler", None) is not None:
             ckpt["scaler"] = self.scaler.state_dict()
 
-        if getattr(self, "use_tpu", False):
-            import torch_xla.core.xla_model as xm
-            xm.save(ckpt, path, master_only=True, global_master=True)
-        else:
-            if self.is_master:
-                torch.save(ckpt, path)
+        if self.is_master:
+            torch.save(ckpt, path)
 
         if not self.is_master:
             return
@@ -438,7 +393,6 @@ class Trainer:
         # Local cleanup
         if step_num is not None:
             try:
-                import re
                 ckpt_dir = os.path.dirname(path)
                 files = os.listdir(ckpt_dir)
                 ckpt_files = [f for f in files if re.match(r"checkpoint-\d+\.pt", f)]
@@ -447,7 +401,7 @@ class Trainer:
                     to_delete = ckpt_files[:-max_ckpt]
                     for f in to_delete:
                         os.remove(os.path.join(ckpt_dir, f))
-            except Exception as e:
+            except Exception:
                 pass
 
         # Background HuggingFace sync
@@ -458,13 +412,11 @@ class Trainer:
                     import warnings
                     from huggingface_hub.utils import disable_progress_bars
                     disable_progress_bars()
-                    # Suppress HF warnings temporarily
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
                         from huggingface_hub import CommitOperationAdd, CommitOperationDelete, HfApi
                         import shutil
                         import uuid
-                        import re
                         
                         api = HfApi(token=hf_token)
                         repo_id = self.config.hf_repo
@@ -523,7 +475,6 @@ class Trainer:
                                             commit_message=f"Cleanup old checkpoints (keeping latest {max_ckpt})"
                                         )
                                         
-                                        # Squash history to permanently delete invisible LFS objects from HF backend
                                         if hasattr(api, 'super_squash_history'):
                                             try:
                                                 api.super_squash_history(
@@ -549,7 +500,7 @@ class Trainer:
 
     def load_checkpoint(self, path):
         # In DDP, stagger loading across ranks to avoid peak host CPU RAM spikes
-        if self.is_ddp and not self.use_tpu:
+        if self.is_ddp:
             import torch.distributed as dist
             if dist.is_initialized():
                 local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -563,9 +514,6 @@ class Trainer:
         self._load_ckpt_internal(path)
 
     def _load_ckpt_internal(self, path):
-        # Load on CPU first to avoid a GPU memory spike (checkpoint + model +
-        # EMA + optimizer state would otherwise all be materialised on-device).
-        # load_state_dict copies to the device incrementally.
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         base_model = self.model.module if hasattr(self.model, "module") else self.model
         base_model.load_state_dict(ckpt["model_state_dict"])
@@ -573,7 +521,6 @@ class Trainer:
         self.iter_num = ckpt.get("iter_num", 0)
         self.best_val_loss = ckpt.get("best_val_loss", float("inf"))
 
-        # Backwards compatibility for checkpoints saved with the old off-by-one bug
         if self.iter_num > 0 and self.iter_num % self.config.save_interval == 0:
             self.iter_num += 1
 
@@ -599,24 +546,17 @@ class Trainer:
                 if self.is_master:
                     print(f"Restored streaming dataset state (chunks yielded: {ds_state.get('chunks_yielded', 'N/A')}, epoch: {ds_state.get('epoch', 0)})")
             else:
-                # Fallback for legacy checkpoints saved without dataset_state
                 if self.iter_num > 0 and self.is_master:
                     print(f"Note: Checkpoint from step {self.iter_num} has no saved dataset state. Shifting seed to avoid duplicate data replay.")
                     if hasattr(self.train_dataset, "seed"):
                         self.train_dataset.seed += (self.iter_num // 1000 + 1)
 
-            # Re-initialize the training iterator to apply restored stream state
-            if self.use_tpu:
-                import torch_xla.distributed.parallel_loader as pl
-                self.train_device_loader = pl.MpDeviceLoader(self.train_loader, self.device)
-                self.train_iter = iter(self.train_device_loader)
-            else:
-                self.train_iter = iter(self.train_loader)
+            self.train_iter = iter(self.train_loader)
 
         del ckpt
         import gc
         gc.collect()
-        if not self.use_tpu and torch.cuda.is_available():
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
         try:
             import ctypes
@@ -627,7 +567,7 @@ class Trainer:
             print(f"Loaded checkpoint from {path} (iteration {self.iter_num}, best val loss: {self.best_val_loss:.4f})")
 
     def generate_samples(self):
-        if not self.is_master or self.use_tpu:
+        if not self.is_master:
             return
         base_model = self.model.module if hasattr(self.model, "module") else self.model
         base_model.eval()
@@ -662,13 +602,7 @@ class Trainer:
             * self.config.block_size
             * self.config.gradient_accumulation_steps
         )
-        if self.use_tpu:
-            try:
-                import torch_xla.runtime as xr
-                tps *= xr.world_size()
-            except (ImportError, AttributeError):
-                tps *= xm.xrt_world_size()
-        elif self.is_ddp:
+        if self.is_ddp:
             tps *= int(os.environ.get('WORLD_SIZE', 1))
         return tps
 
@@ -678,17 +612,13 @@ class Trainer:
         optimizer = self.optimizer
         scaler = self.scaler
 
-        if getattr(self, "use_tpu", False):
-            import torch_xla.core.xla_model as xm
-
         # ── Log config at training start ─────────────────────────────────
         if self.iter_num == 0 and self.is_master and self.flog:
             self.flog.log_config(config, self.n_params)
 
-        if not self.use_tpu and torch.cuda.is_available():
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
         model.train()
-        # On TPU, use a device tensor to avoid float+tensor graph shape changes
         running_loss = 0.0
         start_time = time.time()
         self._last_log_time = start_time
@@ -714,48 +644,36 @@ class Trainer:
 
             x, y = self.get_batch("train")
 
-            if self.use_tpu:
-                # On TPU, bfloat16 is handled natively via XLA_USE_BF16
-                logits, _ = model(x)
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    y.view(-1),
-                )
-                loss = loss / config.gradient_accumulation_steps
-                loss.backward()
-                last_loss = loss.detach()
-                del logits, loss
-                # Keep graph bounded to 1 microstep to prevent CPU RAM OOM during compilation
-                if config.gradient_accumulation_steps > 1 and (self.micro_step + 1) % config.gradient_accumulation_steps != 0:
-                    xm.mark_step()
-            else:
-                # DDP no_sync: skip all-reduce on all micro-steps except the last
-                is_last_micro = (self.micro_step + 1) % config.gradient_accumulation_steps == 0
-                ctx = contextlib.nullcontext() if (not self.is_ddp or is_last_micro) else model.no_sync()
-                with ctx:
-                    with torch.amp.autocast(
-                        "cuda",
-                        dtype=_DTYPE_MAP.get(config.dtype, torch.float16),
-                        enabled=config.dtype != "float32",
-                    ):
-                        logits, _ = model(x)
-                        loss = F.cross_entropy(
-                            logits.view(-1, logits.size(-1)),
-                            y.view(-1),
-                        ) / config.gradient_accumulation_steps
-                    scaler.scale(loss).backward()
+            # DDP no_sync: skip all-reduce on all micro-steps except the last
+            is_last_micro = (self.micro_step + 1) % config.gradient_accumulation_steps == 0
+            ctx = contextlib.nullcontext() if (not self.is_ddp or is_last_micro) else model.no_sync()
+            with ctx:
+                with torch.amp.autocast(
+                    "cuda",
+                    dtype=_DTYPE_MAP.get(config.dtype, torch.float16),
+                    enabled=(self.device.type == "cuda" and config.dtype != "float32"),
+                ):
+                    logits, _ = model(x)
+                    loss = F.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        y.view(-1),
+                    ) / config.gradient_accumulation_steps
                 
-                # Save loss before deleting to avoid UnboundLocalError
-                last_loss = loss.detach()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            
+            last_loss = loss.detach()
 
-                # Free activations and batch tensors immediately before next micro-step
-                del logits, loss, x, y
+            # Free activations and batch tensors immediately before next micro-step
+            del logits, loss, x, y
 
-                try:
-                    import ctypes
-                    ctypes.CDLL("libc.so.6").malloc_trim(0)
-                except Exception:
-                    pass
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
 
             self.micro_step += 1
             if pbar:
@@ -766,26 +684,13 @@ class Trainer:
             if self.micro_step % config.gradient_accumulation_steps == 0:
                 # ── Gradient clipping + norm tracking ────────────────────
                 grad_norm = 0.0
-                if self.use_tpu:
-                    # TPU: 1. Synchronize gradients across all 8 cores
-                    xm.reduce_gradients(optimizer)
-                    # 2. Clip gradients on synchronized grads
-                    if config.grad_clip > 0.0:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), config.grad_clip
-                        )
-                    # 3. Step optimizer on synchronized gradients
-                    optimizer.step()
-                    # 4. Mark step boundary
-                    xm.mark_step()
-                else:
+                if scaler is not None:
                     if config.grad_clip > 0.0:
                         scaler.unscale_(optimizer)
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             model.parameters(), config.grad_clip
                         ).item()
                     else:
-                        # Still compute norm for logging even without clipping
                         total_norm_sq = 0.0
                         for p in model.parameters():
                             if p.grad is not None:
@@ -794,23 +699,27 @@ class Trainer:
 
                     scaler.step(optimizer)
                     scaler.update()
-
-                if self.use_tpu:
-                    optimizer.zero_grad(set_to_none=False)
                 else:
-                    optimizer.zero_grad(set_to_none=True)
+                    if config.grad_clip > 0.0:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), config.grad_clip
+                        ).item()
+                    else:
+                        total_norm_sq = 0.0
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                total_norm_sq += p.grad.data.float().norm().item() ** 2
+                        grad_norm = total_norm_sq ** 0.5
+                    optimizer.step()
+
+                optimizer.zero_grad(set_to_none=True)
 
                 if self.ema is not None:
                     self.ema.update()
 
-                if self.use_tpu:
-                    step_loss = (last_loss.item() if torch.is_tensor(last_loss) else last_loss) * config.gradient_accumulation_steps
-                    running_loss += step_loss
-                    self._grad_norm_sum += (grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm)
-                else:
-                    step_loss = last_loss.item() * config.gradient_accumulation_steps
-                    running_loss += step_loss
-                    self._grad_norm_sum += grad_norm
+                step_loss = last_loss.item() * config.gradient_accumulation_steps
+                running_loss += step_loss
+                self._grad_norm_sum += grad_norm
                 self._grad_norm_count += 1
                 self._tokens_processed += tokens_per_step
 
@@ -891,27 +800,21 @@ class Trainer:
 
                     # Compute metrics for display
                     elapsed = time.time() - start_time
-                    now = time.time()
                     sec_per_step = elapsed / max(self._steps_taken_since_resume, 1)
                     steps_remaining = config.max_iters - self.iter_num
                     eta = steps_remaining * sec_per_step
                     vram_alloc, vram_total = _vram_gb()
-                    if self.use_tpu:
-                        avg_gn = self._grad_norm_sum.item() if torch.is_tensor(self._grad_norm_sum) else self._grad_norm_sum
-                    else:
-                        avg_gn = self._grad_norm_sum / max(self._grad_norm_count, 1)
+                    avg_gn = self._grad_norm_sum / max(self._grad_norm_count, 1)
                     tok_sec = tokens_per_step / max(sec_per_step, 1e-6)
 
                     is_best = val_loss < self.best_val_loss
 
                     if self.is_master:
-                        # Terminal — structured eval block
                         hr = "═" * 56
                         pct = self.iter_num / config.max_iters * 100
                         delta_val = val_loss - self.best_val_loss if self.best_val_loss < float("inf") else 0.0
                         delta_str = f"Δ: {delta_val:+.4f}" if not is_best else "NEW BEST ★"
 
-                        # Terminal — structured eval block
                         eval_str = (
                             f"\n{hr}\n"
                             f"  EVALUATION @ Step {self.iter_num} / {config.max_iters}   ({pct:.1f}%)\n"
@@ -935,7 +838,6 @@ class Trainer:
                         else:
                             print(eval_str)
 
-                        # File log — structured eval block
                         if self.flog:
                             self.flog.log_eval(
                                 step=self.iter_num,
@@ -955,7 +857,6 @@ class Trainer:
                                 tokens=self._tokens_processed,
                             )
 
-                        # Update tqdm postfix
                         if pbar:
                             pbar.set_postfix({
                                 "train": f"{train_loss:.4f}",
@@ -964,14 +865,12 @@ class Trainer:
                                 "lr": f"{lr:.2e}",
                             })
 
-                    # Save checkpoint (master only — handled inside save_checkpoint)
                     ckpt_path = f"checkpoints/checkpoint-{self.iter_num + 1:06d}.pt"
                     if is_best:
                         self.best_val_loss = val_loss
                     self.save_checkpoint(ckpt_path, step_num=self.iter_num + 1)
 
-                    # Defrag memory after eval's memory spike
-                    if not self.use_tpu and torch.cuda.is_available():
+                    if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
                 if self.iter_num % config.gen_interval == 0 and self.iter_num > 0:
