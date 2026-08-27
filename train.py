@@ -1,11 +1,17 @@
 """
 train.py  —  BellHart GPU Training Entrypoint (Single GPU & Distributed DDP)
 =============================================================================
-Launches pre-training with:
-  - Dynamic hardware detection (H100, A100, L4, RTX, T4)
-  - VRAM auto-scaling (batch size, grad accum, precision, optimizer)
-  - Automatic sync with HuggingFace datasets/checkpoints
-  - DistributedDataParallel (DDP) support for multi-GPU nodes
+Main execution script for launching BellHart pre-training.
+
+Key Responsibilities:
+  1. Hardware Auto-Detection & Scaling — Detects available VRAM (H100, A100, L4, RTX, T4)
+     and automatically adjusts batch sizes, gradient accumulation, precision, and optimizer.
+  2. Multi-GPU DistributedDataParallel (DDP) — Configures process groups, rank assignments,
+     and GPU device bindings for multi-GPU training nodes.
+  3. HuggingFace Cloud Synchronization — Automatically downloads latest remote checkpoints
+     and logs before training begins.
+  4. Memory-Safe Process Management — Enforces clean subprocess limits and garbage collection
+     to prevent Linux OOM-killer termination on shared-memory platforms.
 """
 
 import os
@@ -17,7 +23,8 @@ import warnings
 import logging
 import re
 
-# ── Clean Terminal & Logging Setup ───────────────────────────────────────────
+# ── Clean Terminal & Logging Environment Setup ───────────────────────────────
+# Suppress benign framework warnings across all distributed worker processes
 warnings.filterwarnings("ignore")
 warnings.simplefilter("ignore")
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -34,6 +41,7 @@ logging.getLogger("accelerate").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 torch.set_num_threads(2)
 
+# Prevent CUDA memory fragmentation via expandable memory segments
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from huggingface_hub import login, hf_hub_download
@@ -44,11 +52,16 @@ from dataset import create_streaming_dataloaders
 
 
 def _is_proc_master() -> bool:
+    """Check whether current process is Rank 0 before full initialization."""
     rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
     return rank == 0
 
 
 def sync_huggingface(repo_id: str):
+    """
+    Downloads the latest available checkpoint and training logs from the Hugging Face repository.
+    Ensures seamless continuity when training across multiple ephemeral cloud sessions.
+    """
     if _is_proc_master():
         print("Syncing dataset and tokenizer from HuggingFace...")
     os.makedirs("data", exist_ok=True)
@@ -63,6 +76,7 @@ def sync_huggingface(repo_id: str):
         api = HfApi(token=hf_token)
         files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
 
+        # Scan for numbered checkpoint files: checkpoint-XXXXXX.pt
         ckpt_files = [f for f in files if re.match(r"^checkpoints/checkpoint-\d+\.pt$", f)]
         if ckpt_files:
             ckpt_files.sort(
@@ -96,6 +110,7 @@ def sync_huggingface(repo_id: str):
         if _is_proc_master():
             print(f"No existing checkpoint found on HuggingFace ({e}).")
         
+    # Download persistent training log
     try:
         hf_hub_download(repo_id=repo_id, filename="logs/training_log.txt", repo_type="dataset", local_dir=".")
         if _is_proc_master():
@@ -108,6 +123,7 @@ def sync_huggingface(repo_id: str):
 
 
 def setup_environment(config: GPTConfig):
+    """Configures CUDA backend settings, TF32 execution, and cuDNN autotuning."""
     if config.device == "cuda" and torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = config.tf32
         torch.backends.cudnn.allow_tf32 = config.tf32
@@ -120,7 +136,10 @@ def setup_environment(config: GPTConfig):
         print(f"AMP dtype: {config.dtype}")
 
 
-def _train_worker(hf_token=None):
+def _train_worker(hf_token: str = ""):
+    """
+    Main training execution function. Runs per-process on single-GPU or across DDP ranks.
+    """
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -130,12 +149,14 @@ def _train_worker(hf_token=None):
     except RuntimeError:
         pass
 
+    # Parse Hugging Face authentication token
     if not hf_token:
         parser = argparse.ArgumentParser()
         parser.add_argument("--hf_token", type=str, default="", help="HuggingFace WRITE Token")
         args, _ = parser.parse_known_args()
         hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
 
+    # DistributedDataParallel (DDP) detection
     is_ddp = int(os.environ.get('RANK', -1)) != -1
     
     if is_ddp:
@@ -145,7 +166,7 @@ def _train_worker(hf_token=None):
         ddp_local_rank = int(os.environ['LOCAL_RANK'])
         ddp_world_size = int(os.environ['WORLD_SIZE'])
         torch.cuda.set_device(ddp_local_rank)
-        is_master = ddp_rank == 0
+        is_master = (ddp_rank == 0)
         seed_offset = ddp_rank
         global_rank = ddp_rank
         world_size = ddp_world_size
@@ -162,6 +183,7 @@ def _train_worker(hf_token=None):
         login(token=hf_token)
         os.environ["HF_TOKEN"] = hf_token
 
+    # Configuration loading and synchronization
     config_path = "config.json"
     if is_master:
         if os.path.exists(config_path):
@@ -174,6 +196,7 @@ def _train_worker(hf_token=None):
     else:
         config = GPTConfig()
 
+    # Synchronize configuration file across distributed ranks
     if is_ddp:
         import torch.distributed as dist
         dist.barrier()
@@ -182,6 +205,7 @@ def _train_worker(hf_token=None):
 
     repo_id = config.hf_repo
 
+    # Master downloads latest checkpoints while workers wait at barrier
     if is_master:
         sync_huggingface(repo_id)
 
@@ -189,32 +213,32 @@ def _train_worker(hf_token=None):
         import torch.distributed as dist
         dist.barrier()
 
-    # ── Dynamic GPU VRAM auto-scaling ─────────────────────────────────────
+    # ── Dynamic GPU VRAM Hardware Auto-Scaling ───────────────────────────
     if torch.cuda.is_available():
         vram_gb = torch.cuda.get_device_properties(ddp_local_rank).total_memory / 1e9
         original_effective_batch = config.batch_size * config.gradient_accumulation_steps
 
-        # Pre-train at 2K context; extend to 4K/8K during finetuning via RoPE
+        # Standardize pre-training context length to 2048 tokens
         config.block_size = 2048
 
-        # Scale batch_size and optimizations based on available VRAM
-        if vram_gb >= 70:       # H100 80GB / A100 80GB
+        # Tiered scaling based on hardware capacity
+        if vram_gb >= 70:       # NVIDIA H100 80GB / A100 80GB
             new_batch = 8
             config.compile = False
             config.gradient_checkpointing = 1
             config.save_interval = 400
-        elif vram_gb >= 35:     # A100 40GB
+        elif vram_gb >= 35:     # NVIDIA A100 40GB
             new_batch = 4
             config.compile = False
             config.gradient_checkpointing = 1
             config.save_interval = 200
-        elif vram_gb >= 20:     # NVIDIA L4 / RTX 3090 / 4090 (24GB)
+        elif vram_gb >= 20:     # NVIDIA L4 / RTX 3090 / RTX 4090 (24GB)
             new_batch = 2
             config.compile = False
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
             config.save_interval = 25
-        else:                   # T4 16GB / RTX 3060 etc.
+        else:                   # NVIDIA T4 16GB / RTX 3060
             new_batch = 1
             config.compile = False
             config.use_8bit_optimizer = True
@@ -223,6 +247,7 @@ def _train_worker(hf_token=None):
         base_eval_batches = 20
         config.eval_iters = max(5, base_eval_batches // new_batch)
 
+        # Re-compute gradient accumulation to maintain constant global batch size across DDP ranks
         if is_ddp:
             target_accum = max(1, original_effective_batch // (new_batch * ddp_world_size))
             config.gradient_accumulation_steps = target_accum
@@ -231,7 +256,7 @@ def _train_worker(hf_token=None):
             config.batch_size = new_batch
             config.gradient_accumulation_steps = max(1, original_effective_batch // new_batch)
 
-        # Enable hardware optimizations for Ampere+ GPUs (A100/H100/RTX 30xx+)
+        # Enable Ampere+ hardware acceleration (TF32 and native bfloat16)
         gpu_name = torch.cuda.get_device_name(ddp_local_rank).upper()
         is_ampere_plus = vram_gb >= 20 or any(tag in gpu_name for tag in ["A100", "H100", "H200", "RTX 30", "RTX 40", "RTX 50"])
 
@@ -255,9 +280,11 @@ def _train_worker(hf_token=None):
 
     setup_environment(config)
 
+    # Initialize Tokenizer and sync vocabulary size
     tokenizer = Tokenizer()
     config.vocab_size = tokenizer.vocab_size
 
+    # Create dynamic streaming dataloaders
     use_pin_memory = (config.device == "cuda" and torch.cuda.is_available())
     train_loader, val_loader = create_streaming_dataloaders(
         dataset_name="openbmb/Ultra-FineWeb-L1",
@@ -272,8 +299,10 @@ def _train_worker(hf_token=None):
         world_size=world_size,
     )
 
+    # Initialize Trainer pipeline
     trainer = Trainer(config, tokenizer, train_loader, val_loader, is_ddp=is_ddp)
 
+    # Check for local checkpoints to resume
     import glob
     checkpoints = glob.glob("checkpoints/checkpoint-*.pt")
     valid_checkpoints = [f for f in checkpoints if re.search(r"checkpoint-(\d+)\.pt", os.path.basename(f))]
@@ -290,11 +319,16 @@ def _train_worker(hf_token=None):
             print("Resuming training from checkpoint: checkpoints/latest.pt")
         trainer.load_checkpoint("checkpoints/latest.pt")
 
+    # Reclaim host RAM before launching training loop
+    import gc
+    gc.collect()
+
+    # Launch training
     try:
         trainer.train()
     except KeyboardInterrupt:
         if is_master:
-            print("\nInterrupted, saving checkpoint...")
+            print("\nInterrupted by user. Saving emergency checkpoint...")
             ckpt_path = f"checkpoints/checkpoint-{trainer.iter_num:06d}.pt"
             trainer.save_checkpoint(ckpt_path, step_num=trainer.iter_num)
             print(f"Checkpoint saved to {ckpt_path}. Exiting.")
@@ -308,7 +342,8 @@ def _train_worker(hf_token=None):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    """Command-line entry point."""
+    parser = argparse.ArgumentParser(description="BellHart Pre-Training Pipeline")
     parser.add_argument("--hf_token", type=str, default="", help="HuggingFace WRITE Token")
     args, _ = parser.parse_known_args()
     hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")

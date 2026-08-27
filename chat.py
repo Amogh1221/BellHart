@@ -1,6 +1,17 @@
+"""
+chat.py  —  Interactive Terminal Chat Interface
+=================================================
+Runs an interactive conversation loop with fine-tuned BellHart models using
+streaming token decoding and KV caching.
+
+Usage:
+    python chat.py --model_dir models/nano-chat
+"""
+
 import os
 import sys
 import json
+import argparse
 import torch
 from safetensors.torch import load_file
 
@@ -8,18 +19,17 @@ from config import GPTConfig
 from model import GPT
 from tokenizer import Tokenizer
 
-import argparse
 
 def main():
-    parser = argparse.ArgumentParser(description="Chat with BellHartGPT in the terminal")
-    parser.add_argument("--model_dir", type=str, default="models/nano-chat", help="Directory of the custom model")
+    parser = argparse.ArgumentParser(description="Chat with BellHart in the terminal")
+    parser.add_argument("--model_dir", type=str, default="models/nano-chat", help="Directory containing the model checkpoint and tokenizer")
     args = parser.parse_args()
     
     model_dir = args.model_dir
     
     if not os.path.exists(model_dir):
-        print(f"Error: Could not find {model_dir}/")
-        print("Please make sure you downloaded the fine-tuned model.")
+        print(f"Error: Could not find model directory {model_dir}/")
+        print("Please ensure the fine-tuned model weights are downloaded.")
         sys.exit(1)
 
     tokenizer_path = f"{model_dir}/tokenizer.json"
@@ -36,9 +46,8 @@ def main():
     })
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"Using compute device: {device}")
     
-    # Enable fast inference on H100
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -46,30 +55,22 @@ def main():
     print("Initializing model...")
     model = GPT(config).to(device)
 
-    print(f"Loading safetensors weights from {model_dir}/model.safetensors...")
+    print(f"Loading weights from {model_dir}/model.safetensors...")
     state_dict = load_file(f"{model_dir}/model.safetensors")
     
-    # Remove _orig_mod prefix if it exists (from torch.compile)
-    clean_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith("_orig_mod."):
-            clean_state_dict[k.replace("_orig_mod.", "")] = v
-        else:
-            clean_state_dict[k] = v
+    # Strip compiled model prefix if present
+    clean_state_dict = {
+        (k.replace("_orig_mod.", "") if k.startswith("_orig_mod.") else k): v
+        for k, v in state_dict.items()
+    }
             
     model.load_state_dict(clean_state_dict)
     model.eval()
 
-    # We disable torch.compile for the terminal chat because compiling the 
-    # dynamic autoregressive streaming loop takes minutes on Windows.
-    # if hasattr(torch, "compile"):
-    #     print("Compiling model for fast chat...")
-    #     model = torch.compile(model, mode="default")
-
-    print("\n" + "="*50)
-    print(" 🤖 BellHart Chat is Ready!")
-    print(" Type 'quit' or 'exit' to stop.")
-    print("="*50 + "\n")
+    print("\n" + "=" * 50)
+    print(" 🤖 BellHart Chat Ready")
+    print(" Type 'quit' or 'exit' to end conversation.")
+    print("=" * 50 + "\n")
 
     chat_history = ""
 
@@ -81,30 +82,28 @@ def main():
             if not user_input.strip():
                 continue
 
-            # Format strictly like the training data
+            # Format input using conversational prompt structure
             chat_history += f"User: {user_input}\nAssistant: "
-            
-            # Tokenize and enforce memory limits
             tokens = tokenizer.encode(chat_history)
             
-            # Simple Memory: If conversation gets too long, forget the oldest parts
+            # Enforce maximum context window limits
             max_context = config.block_size - 512
             if len(tokens) > max_context:
                 tokens = tokens[-max_context:]
                 
             context = torch.tensor([tokens], dtype=torch.long, device=device)
 
-            # Generate
             print("Assistant: ", end="", flush=True)
             response = ""
             
+            # Streaming autoregressive generation
             with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 past_key_values = None
                 idx = context
                 
-                for _ in range(512): # max_new_tokens
+                for _ in range(512):
                     if past_key_values is not None:
-                        past_len = past_key_values[0][0].size(-2)
+                        past_len = past_key_values[0][0].size(2)
                         if past_len >= config.block_size:
                             past_key_values = None
                             idx_cond = idx[:, -config.block_size:]
@@ -114,9 +113,9 @@ def main():
                         idx_cond = idx[:, -config.block_size:]
 
                     logits, past_key_values = model(idx_cond, past_key_values=past_key_values, use_cache=True)
-                    logits = logits[:, -1, :] / 0.7 # temperature
+                    logits = logits[:, -1, :] / 0.7  # Temperature scaling
                     
-                    # Top-k
+                    # Top-K sampling
                     v, _ = torch.topk(logits, min(50, logits.size(-1)))
                     logits[logits < v[:, [-1]]] = -float("Inf")
                     
@@ -128,7 +127,7 @@ def main():
                         
                     idx = torch.cat((idx, idx_next), dim=1)
                     
-                    # Decode the single token and print it instantly
+                    # Stream single decoded token immediately
                     word = tokenizer.decode([idx_next.item()])
                     response += word
                     print(word, end="", flush=True)
@@ -136,19 +135,19 @@ def main():
                     if "User:" in response or "\nUser" in response:
                         break
                         
-            print() # Newline after generation completes
+            print()
             
-            # Clean up any partial hallucinations from the history
+            # Trim trailing prompt artifacts
             if "User:" in response:
                 response = response.split("User:")[0].strip()
             if "\nUser" in response:
                 response = response.split("\nUser")[0].strip()
 
-            # Append the actual response to history so it remembers context
             chat_history += response + "\n"
 
         except KeyboardInterrupt:
             break
+
 
 if __name__ == "__main__":
     main()
