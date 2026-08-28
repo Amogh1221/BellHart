@@ -182,8 +182,18 @@ def _train_worker(hf_token: str = ""):
         world_size = 1
 
     if hf_token:
-        login(token=hf_token)
-        os.environ["HF_TOKEN"] = hf_token
+        try:
+            login(token=hf_token)
+            os.environ["HF_TOKEN"] = hf_token
+            if is_master:
+                print("Authenticated with Hugging Face successfully.")
+        except Exception as e:
+            if is_master:
+                print(f"\n[WARNING] Hugging Face authentication failed: {e}")
+                print("The provided HF_TOKEN is invalid or expired.")
+                print("Training will continue locally, but checkpoints will NOT be synced to Hugging Face.\n")
+            os.environ["HF_TOKEN"] = ""
+            hf_token = ""
 
     # Configuration loading and synchronization
     config_path = "config.json"

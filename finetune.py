@@ -526,8 +526,15 @@ def main():
     args = parser.parse_args()
 
     # ── Auth ─────────────────────────────────────────────────────────────
-    login(token=args.hf_token)
-    os.environ["HF_TOKEN"] = args.hf_token
+    if args.hf_token:
+        try:
+            login(token=args.hf_token)
+            os.environ["HF_TOKEN"] = args.hf_token
+            print("Authenticated with Hugging Face successfully.")
+        except Exception as e:
+            print(f"\n[WARNING] Hugging Face authentication failed: {e}")
+            print("The provided HF_TOKEN is invalid or expired.")
+            os.environ["HF_TOKEN"] = ""
 
     # Ensure tqdm progress bars are shown for all HF downloads/uploads
     from huggingface_hub.utils import enable_progress_bars
