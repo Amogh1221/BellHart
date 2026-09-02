@@ -586,22 +586,28 @@ class Trainer:
         # Restore optimizer state safely (handles switching between 8-bit AdamW and standard 32-bit AdamW)
         if "optimizer_state_dict" in ckpt:
             try:
-                opt_state = ckpt["optimizer_state_dict"]
-                state_dict_entries = opt_state.get("state", {})
-                is_bnb_state = any("state1" in s or "qmap1" in s for s in state_dict_entries.values())
-                is_current_bnb = "bitsandbytes" in type(self.optimizer).__module__
+                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
-                if is_bnb_state and not is_current_bnb:
-                    if self.is_master:
-                        print("  [Optimizer Migration] Checkpoint contains 8-bit AdamW states. Starting fresh 32-bit AdamW states for high-memory GPU.")
-                elif not is_bnb_state and is_current_bnb:
-                    if self.is_master:
-                        print("  [Optimizer Migration] Checkpoint contains standard AdamW states. Starting fresh 8-bit AdamW states.")
-                else:
-                    self.optimizer.load_state_dict(opt_state)
+                # Validate: after loading, check if the state keys are compatible
+                # with the current optimizer. Standard AdamW expects "exp_avg";
+                # bitsandbytes 8-bit AdamW uses "state1"/"state2"/etc.
+                # If we loaded 8-bit state into 32-bit optimizer (or vice versa),
+                # the keys won't match and optimizer.step() will crash with KeyError.
+                for param_state in self.optimizer.state.values():
+                    if isinstance(param_state, dict) and len(param_state) > 1:
+                        is_standard_adam = not hasattr(self.optimizer, "is_paged")
+                        if is_standard_adam and "exp_avg" not in param_state:
+                            raise ValueError(
+                                "Incompatible optimizer state: checkpoint has 8-bit AdamW format "
+                                "but current optimizer is standard 32-bit AdamW"
+                            )
+                        break  # Only need to check one parameter
+
             except Exception as e:
                 if self.is_master:
-                    print(f"  [Optimizer Warning] Could not load optimizer state ({e}). Optimizer will re-warm from current step.")
+                    print(f"  [Optimizer Migration] {e}")
+                    print(f"  [Optimizer Migration] Starting with fresh optimizer momentum. Model weights are intact.")
+                self.optimizer.state.clear()
 
         self.iter_num = ckpt.get("iter_num", 0)
         self.best_val_loss = ckpt.get("best_val_loss", float("inf"))
