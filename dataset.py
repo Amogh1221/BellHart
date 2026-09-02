@@ -207,6 +207,7 @@ def create_streaming_dataloaders(
     dataset_config: Optional[str] = None,
     rank: int = 0,
     world_size: int = 1,
+    buffer_size: int = 1,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Builds training and validation DataLoaders using streaming iterables.
@@ -219,7 +220,7 @@ def create_streaming_dataloaders(
         split="train",
         tokenizer=tokenizer,
         block_size=block_size,
-        buffer_size=1,
+        buffer_size=buffer_size,
         seed=seed,
         config_name=dataset_config,
         rank=rank,
@@ -231,7 +232,7 @@ def create_streaming_dataloaders(
         split="train",
         tokenizer=tokenizer,
         block_size=block_size,
-        buffer_size=1,
+        buffer_size=1,  # Keep validation evaluation deterministic
         seed=seed + 100_000,
         config_name=dataset_config,
         rank=rank,

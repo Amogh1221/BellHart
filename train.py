@@ -138,7 +138,7 @@ def setup_environment(config: GPTConfig):
         print(f"AMP dtype: {config.dtype}")
 
 
-def _train_worker(hf_token: str = ""):
+def _train_worker(hf_token: str = "", fresh: bool = False):
     """
     Main training execution function. Runs per-process on single-GPU or across DDP ranks.
     """
@@ -151,12 +151,15 @@ def _train_worker(hf_token: str = ""):
     except RuntimeError:
         pass
 
-    # Parse Hugging Face authentication token
+    # Parse Hugging Face authentication token and run flags
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hf_token", type=str, default="", help="HuggingFace WRITE Token")
+    parser.add_argument("--fresh", action="store_true", help="Start training fresh from Step 0, ignoring existing checkpoints")
+    args, _ = parser.parse_known_args()
     if not hf_token:
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--hf_token", type=str, default="", help="HuggingFace WRITE Token")
-        args, _ = parser.parse_known_args()
         hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
+    if args.fresh:
+        fresh = True
 
     # DistributedDataParallel (DDP) detection
     is_ddp = int(os.environ.get('RANK', -1)) != -1
@@ -217,9 +220,14 @@ def _train_worker(hf_token: str = ""):
 
     repo_id = config.hf_repo
 
-    # Master downloads latest checkpoints while workers wait at barrier
-    if is_master:
+    # Master downloads latest checkpoints unless --fresh is specified
+    if is_master and not fresh:
         sync_huggingface(repo_id)
+    elif is_master and fresh:
+        print("\n" + "═" * 60)
+        print("  [FRESH RUN] Starting brand new training from Step 0!")
+        print("  Skipping checkpoint download from Hugging Face.")
+        print("═" * 60 + "\n")
 
     if is_ddp:
         import torch.distributed as dist
@@ -289,14 +297,28 @@ def _train_worker(hf_token: str = ""):
             config.dtype = "float16"
             config.tf32 = False
 
+        # Dynamic streaming shuffle buffer:
+        # B200 / H100 with massive host RAM use 10,000 document shuffle buffer
+        # to ensure diverse batches on single GPU without cluster bias.
+        if vram_gb >= 140:
+            stream_buffer_size = 10000
+        elif vram_gb >= 70:
+            stream_buffer_size = 5000
+        elif vram_gb >= 35:
+            stream_buffer_size = 2500
+        else:
+            stream_buffer_size = 1  # Low memory / DDP multi-shard
+
         if is_master:
             print(f"Auto-scaled for {vram_gb:.0f}GB VRAM → "
                   f"block_size={config.block_size}, "
                   f"batch_size={config.batch_size}, "
                   f"grad_accum={config.gradient_accumulation_steps}, "
                   f"eval_iters={config.eval_iters}, "
+                  f"stream_buffer={stream_buffer_size}, "
                   f"dtype={config.dtype}, tf32={config.tf32}")
     else:
+        stream_buffer_size = 1
         config.device = "cpu"
         print("WARNING: No GPU found, falling back to CPU")
 
@@ -314,6 +336,7 @@ def _train_worker(hf_token: str = ""):
         tokenizer=tokenizer,
         block_size=config.block_size,
         batch_size=config.batch_size,
+        buffer_size=stream_buffer_size,
         num_workers=0,
         pin_memory=use_pin_memory,
         seed=42 + seed_offset,
@@ -324,22 +347,23 @@ def _train_worker(hf_token: str = ""):
     # Initialize Trainer pipeline
     trainer = Trainer(config, tokenizer, train_loader, val_loader, is_ddp=is_ddp)
 
-    # Check for local checkpoints to resume
-    import glob
-    checkpoints = glob.glob("checkpoints/checkpoint-*.pt")
-    valid_checkpoints = [f for f in checkpoints if re.search(r"checkpoint-(\d+)\.pt", os.path.basename(f))]
-    if valid_checkpoints:
-        resume_path = sorted(
-            valid_checkpoints,
-            key=lambda x: int(re.search(r"checkpoint-(\d+)\.pt", os.path.basename(x)).group(1))
-        )[-1]
-        if is_master:
-            print(f"Resuming training from checkpoint: {resume_path}")
-        trainer.load_checkpoint(resume_path)
-    elif os.path.exists("checkpoints/latest.pt"):
-        if is_master:
-            print("Resuming training from checkpoint: checkpoints/latest.pt")
-        trainer.load_checkpoint("checkpoints/latest.pt")
+    # Check for local checkpoints to resume (bypassed if --fresh is set)
+    if not fresh:
+        import glob
+        checkpoints = glob.glob("checkpoints/checkpoint-*.pt")
+        valid_checkpoints = [f for f in checkpoints if re.search(r"checkpoint-(\d+)\.pt", os.path.basename(f))]
+        if valid_checkpoints:
+            resume_path = sorted(
+                valid_checkpoints,
+                key=lambda x: int(re.search(r"checkpoint-(\d+)\.pt", os.path.basename(x)).group(1))
+            )[-1]
+            if is_master:
+                print(f"Resuming training from checkpoint: {resume_path}")
+            trainer.load_checkpoint(resume_path)
+        elif os.path.exists("checkpoints/latest.pt"):
+            if is_master:
+                print("Resuming training from checkpoint: checkpoints/latest.pt")
+            trainer.load_checkpoint("checkpoints/latest.pt")
 
     # Reclaim host RAM before launching training loop
     import gc
@@ -367,9 +391,10 @@ def main():
     """Command-line entry point."""
     parser = argparse.ArgumentParser(description="BellHart Pre-Training Pipeline")
     parser.add_argument("--hf_token", type=str, default="", help="HuggingFace WRITE Token")
+    parser.add_argument("--fresh", action="store_true", help="Start training fresh from Step 0, ignoring existing checkpoints")
     args, _ = parser.parse_known_args()
     hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
-    _train_worker(hf_token=hf_token)
+    _train_worker(hf_token=hf_token, fresh=args.fresh)
 
 
 if __name__ == "__main__":
