@@ -304,11 +304,11 @@ class Trainer:
             EMA(self.model.module if self.is_ddp else self.model, decay=config.ema_decay) if config.use_ema else None
         )
 
-        # Mixed-Precision GradScaler (for float16 training on GPUs without native bfloat16 hardware)
+        # Mixed-Precision GradScaler (only enabled for float16 on GPUs without native bfloat16 hardware)
         self.use_scaler = (self.device.type == "cuda" and config.dtype == "float16")
         self.scaler = torch.amp.GradScaler(
-            "cuda", enabled=self.use_scaler
-        ) if self.device.type == "cuda" else None
+            "cuda", enabled=True
+        ) if self.use_scaler else None
 
         # Data loaders
         self.train_loader = train_loader
@@ -582,7 +582,27 @@ class Trainer:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         base_model = self.model.module if hasattr(self.model, "module") else self.model
         base_model.load_state_dict(ckpt["model_state_dict"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        
+        # Restore optimizer state safely (handles switching between 8-bit AdamW and standard 32-bit AdamW)
+        if "optimizer_state_dict" in ckpt:
+            try:
+                opt_state = ckpt["optimizer_state_dict"]
+                state_dict_entries = opt_state.get("state", {})
+                is_bnb_state = any("state1" in s or "qmap1" in s for s in state_dict_entries.values())
+                is_current_bnb = "bitsandbytes" in type(self.optimizer).__module__
+
+                if is_bnb_state and not is_current_bnb:
+                    if self.is_master:
+                        print("  [Optimizer Migration] Checkpoint contains 8-bit AdamW states. Starting fresh 32-bit AdamW states for high-memory GPU.")
+                elif not is_bnb_state and is_current_bnb:
+                    if self.is_master:
+                        print("  [Optimizer Migration] Checkpoint contains standard AdamW states. Starting fresh 8-bit AdamW states.")
+                else:
+                    self.optimizer.load_state_dict(opt_state)
+            except Exception as e:
+                if self.is_master:
+                    print(f"  [Optimizer Warning] Could not load optimizer state ({e}). Optimizer will re-warm from current step.")
+
         self.iter_num = ckpt.get("iter_num", 0)
         self.best_val_loss = ckpt.get("best_val_loss", float("inf"))
 
