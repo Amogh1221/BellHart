@@ -236,7 +236,7 @@ def _train_worker(hf_token: str = ""):
 
         # Tiered scaling based on hardware capacity (8-bit AdamW used everywhere for 100% checkpoint portability)
         if vram_gb >= 140:      # NVIDIA B200 192GB / B300 / H200 141GB (Blackwell / Hopper Max)
-            new_batch = 8
+            new_batch = 16      # 192GB VRAM: cuts accumulation steps to 2, increasing throughput
             config.compile = False
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 0  # 192GB VRAM easily fits activations -> 30% faster backprop

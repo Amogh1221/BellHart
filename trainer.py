@@ -588,18 +588,19 @@ class Trainer:
             try:
                 self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
-                # Validate: after loading, check if the state keys are compatible
-                # with the current optimizer. Standard AdamW expects "exp_avg";
-                # bitsandbytes 8-bit AdamW uses "state1"/"state2"/etc.
-                # If we loaded 8-bit state into 32-bit optimizer (or vice versa),
-                # the keys won't match and optimizer.step() will crash with KeyError.
+                # Validate: check if loaded state is compatible with current optimizer
+                is_bnb = "bitsandbytes" in type(self.optimizer).__module__
                 for param_state in self.optimizer.state.values():
-                    if isinstance(param_state, dict) and len(param_state) > 1:
-                        is_standard_adam = not hasattr(self.optimizer, "is_paged")
-                        if is_standard_adam and "exp_avg" not in param_state:
+                    if isinstance(param_state, dict) and len(param_state) > 0:
+                        if is_bnb and "state1" not in param_state:
                             raise ValueError(
-                                "Incompatible optimizer state: checkpoint has 8-bit AdamW format "
-                                "but current optimizer is standard 32-bit AdamW"
+                                "Checkpoint has standard 32-bit optimizer format "
+                                "but current optimizer is 8-bit AdamW."
+                            )
+                        elif not is_bnb and "exp_avg" not in param_state:
+                            raise ValueError(
+                                "Checkpoint has 8-bit AdamW format "
+                                "but current optimizer is standard 32-bit AdamW."
                             )
                         break  # Only need to check one parameter
 
