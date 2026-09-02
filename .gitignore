@@ -62,3 +62,5 @@ node_modules/
 .next/
 
 q.txt
+
+logs.txt

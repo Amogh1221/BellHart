@@ -235,7 +235,12 @@ def _train_worker(hf_token: str = ""):
         config.eval_interval = 500  # Evaluate every 500th step
 
         # Tiered scaling based on hardware capacity
-        if vram_gb >= 70:       # NVIDIA H100 80GB / A100 80GB
+        if vram_gb >= 140:      # NVIDIA B200 192GB / B300 / H200 141GB (Blackwell / Hopper Max)
+            new_batch = 8
+            config.compile = False
+            config.gradient_checkpointing = 0  # 192GB VRAM easily fits activations -> 30% faster backprop
+            config.save_interval = 300         # Checkpoint every ~5.5 minutes at B200 speed
+        elif vram_gb >= 70:     # NVIDIA H100 80GB / A100 80GB
             new_batch = 8
             config.compile = False
             config.gradient_checkpointing = 1
@@ -272,7 +277,7 @@ def _train_worker(hf_token: str = ""):
 
         # Enable Ampere+ hardware acceleration (TF32 and native bfloat16)
         gpu_name = torch.cuda.get_device_name(ddp_local_rank).upper()
-        is_ampere_plus = vram_gb >= 20 or any(tag in gpu_name for tag in ["A100", "H100", "H200", "RTX 30", "RTX 40", "RTX 50"])
+        is_ampere_plus = vram_gb >= 20 or any(tag in gpu_name for tag in ["A100", "H100", "H200", "B200", "B300", "RTX 30", "RTX 40", "RTX 50"])
 
         if is_ampere_plus:
             config.dtype = "bfloat16"
