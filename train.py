@@ -234,20 +234,23 @@ def _train_worker(hf_token: str = ""):
         config.block_size = 2048
         config.eval_interval = 500  # Evaluate every 500th step
 
-        # Tiered scaling based on hardware capacity
+        # Tiered scaling based on hardware capacity (8-bit AdamW used everywhere for 100% checkpoint portability)
         if vram_gb >= 140:      # NVIDIA B200 192GB / B300 / H200 141GB (Blackwell / Hopper Max)
             new_batch = 8
             config.compile = False
+            config.use_8bit_optimizer = True
             config.gradient_checkpointing = 0  # 192GB VRAM easily fits activations -> 30% faster backprop
             config.save_interval = 400
         elif vram_gb >= 70:     # NVIDIA H100 80GB / A100 80GB
             new_batch = 8
             config.compile = False
+            config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
             config.save_interval = 400
         elif vram_gb >= 35:     # NVIDIA A100 40GB
             new_batch = 4
             config.compile = False
+            config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
             config.save_interval = 400
         elif vram_gb >= 20:     # NVIDIA L4 / RTX 3090 / RTX 4090 (24GB)
