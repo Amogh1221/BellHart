@@ -249,30 +249,35 @@ def _train_worker(hf_token: str = "", fresh: bool = False):
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 0  # 192GB VRAM easily fits activations -> 30% faster backprop
             config.save_interval = 900         # Checkpoint every ~20 minutes at B200 speed
+            config.log_interval = 100          # Log clean summaries every 100 iterations
         elif vram_gb >= 70:     # NVIDIA H100 80GB / A100 80GB
             new_batch = 8
             config.compile = False
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
             config.save_interval = 400
+            config.log_interval = 100
         elif vram_gb >= 35:     # NVIDIA A100 40GB
             new_batch = 4
             config.compile = False
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
             config.save_interval = 400
+            config.log_interval = 100
         elif vram_gb >= 20:     # NVIDIA L4 / RTX 3090 / RTX 4090 (24GB)
             new_batch = 2
             config.compile = False
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
             config.save_interval = 25
+            config.log_interval = 25
         else:                   # NVIDIA T4 16GB / RTX 3060
             new_batch = 1
             config.compile = False
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
             config.save_interval = 25
+            config.log_interval = 25
 
         base_eval_batches = 20
         config.eval_iters = max(5, base_eval_batches // new_batch)
