@@ -276,7 +276,7 @@ def _train_worker(hf_token: str = "", fresh: bool = False):
             config.compile = False
             config.use_8bit_optimizer = True
             config.gradient_checkpointing = 1
-            config.save_interval = 25
+            config.save_interval = 200
             config.log_interval = 100
 
         base_eval_batches = 20
