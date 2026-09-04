@@ -20,6 +20,7 @@ import contextlib
 import math
 import time
 import re
+import uuid
 import logging
 import threading
 from dataclasses import asdict
@@ -449,10 +450,30 @@ class Trainer:
             ckpt["scaler"] = self.scaler.state_dict()
 
         if self.is_master:
-            torch.save(ckpt, path)
-
-        if not self.is_master:
-            return
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+            
+            # Write atomically with retries in case of transient file-locks on Windows
+            save_success = False
+            for attempt in range(3):
+                try:
+                    torch.save(ckpt, tmp_path)
+                    os.replace(tmp_path, path)
+                    save_success = True
+                    break
+                except Exception as e:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                    if attempt == 2:
+                        print(f"\n[CRITICAL WARNING] Failed to save checkpoint to {path}: {e}", flush=True)
+                    else:
+                        time.sleep(1.0)
+            
+            if not save_success:
+                return
 
         # Local checkpoint rotation (keep latest max_ckpt checkpoints)
         if step_num is not None:
@@ -945,8 +966,13 @@ class Trainer:
                 if self.iter_num % config.gen_interval == 0 and self.iter_num > 0:
                     self.generate_samples()
 
-                # Save regular interval checkpoint
-                if self.iter_num % config.save_interval == 0 and self.iter_num > 0 and self._steps_taken_since_resume > 0:
+                # Save regular interval checkpoint (skip if already saved by eval_interval)
+                if (
+                    self.iter_num % config.save_interval == 0
+                    and self.iter_num % config.eval_interval != 0
+                    and self.iter_num > 0
+                    and self._steps_taken_since_resume > 0
+                ):
                     ckpt_path = f"checkpoints/checkpoint-{self.iter_num + 1:06d}.pt"
                     self.save_checkpoint(ckpt_path, step_num=self.iter_num + 1)
 
