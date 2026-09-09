@@ -512,19 +512,34 @@ def sync_bert_huggingface(repo_id: str, is_master: bool = True):
         return
 
     try:
+        import re
         from huggingface_hub import HfApi, hf_hub_download
         token = os.environ.get("HF_TOKEN")
         api = HfApi(token=token)
         files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
 
-        bert_ckpts = [f for f in files if f.startswith("bert_checkpoints/bert-") and f.endswith(".pt")]
+        # 1. Download latest_bert.pt if available
+        if "bert_checkpoints/latest_bert.pt" in files:
+            print("[BERT] Downloading latest_bert.pt from HuggingFace...")
+            hf_hub_download(repo_id=repo_id, filename="bert_checkpoints/latest_bert.pt", repo_type="dataset", local_dir=".")
+            print("[BERT] Successfully downloaded latest_bert.pt")
+
+        # 2. Check for numbered checkpoints: bert-XXXXXX.pt
+        bert_ckpts = [f for f in files if re.match(r"^bert_checkpoints/bert-\d+\.pt$", f)]
         if bert_ckpts:
-            bert_ckpts.sort(reverse=True)
+            bert_ckpts.sort(key=lambda x: int(re.search(r"bert-(\d+)\.pt", x).group(1)), reverse=True)
             latest = bert_ckpts[0]
             if not os.path.exists(latest):
                 print(f"[BERT] Downloading latest remote checkpoint {latest}...")
                 hf_hub_download(repo_id=repo_id, filename=latest, repo_type="dataset", local_dir=".")
                 print(f"[BERT] Successfully downloaded {latest}")
+
+            # If latest_bert.pt does not exist locally, link or copy the latest numbered checkpoint
+            if not os.path.exists("bert_checkpoints/latest_bert.pt") and os.path.exists(latest):
+                import shutil
+                shutil.copy2(latest, "bert_checkpoints/latest_bert.pt")
+                print(f"[BERT] Linked {latest} -> bert_checkpoints/latest_bert.pt")
+
     except Exception as e:
         print(f"[BERT] Checkpoint sync note: {e}")
 
@@ -750,6 +765,13 @@ def main():
     start_step = 0
     best_val_loss = float("inf")
     latest_ckpt = "bert_checkpoints/latest_bert.pt"
+
+    # Fallback to latest numbered checkpoint if latest_bert.pt is absent
+    if not os.path.exists(latest_ckpt):
+        numbered = sorted(Path("bert_checkpoints").glob("bert-[0-9]*.pt"))
+        if numbered:
+            latest_ckpt = str(numbered[-1])
+
     if os.path.exists(latest_ckpt) and not args.fresh:
         if is_master:
             print(f"[BERT] Resuming from {latest_ckpt}...")
