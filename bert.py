@@ -711,10 +711,7 @@ def main():
     step = start_step
 
     if is_master:
-        print(f"[BERT] Commencing 150,000 steps (~{tokens_per_step:,} tokens/step)...")
-        pbar = tqdm(total=config.max_iters, initial=step, desc="BERT Pre-Training")
-    else:
-        pbar = None
+        print(f"[BERT] Commencing 150,000 steps (~{tokens_per_step:,} tokens/step)...", flush=True)
 
     t0 = time.time()
     t_interval_start = t0
@@ -757,34 +754,32 @@ def main():
         step += 1
         t1 = time.time()
         dt_step = max(t1 - t0, 1e-6)
-        toks_sec_live = tokens_per_step / dt_step
+        toks_sec = tokens_per_step / dt_step
+        tokens_processed = step * tokens_per_step
 
-        # Live terminal screen update every single step
-        if pbar:
-            pbar.update(1)
-            pbar.set_postfix({
-                "loss": f"{accum_loss:.3f}",
-                "lr": f"{lr:.2e}",
-                "tok/s": f"{toks_sec_live:,.0f}"
-            })
-
-        # Structured milestone log & file write every 50 steps
-        if step % config.log_interval == 0 and is_master:
-            dt_50 = t1 - t_interval_start
-            t_interval_start = t1
-            toks_sec_avg = (config.log_interval * tokens_per_step) / max(dt_50, 1e-6)
+        # Print to terminal every single step with immediate flush (exactly like BellHart)
+        if is_master:
             ppl = math.exp(min(accum_loss, 20.0))
-            msg = f"STEP {step:6d}/{config.max_iters} | Loss: {accum_loss:.4f} | PPL: {ppl:.2f} | LR: {lr:.2e} | Norm: {grad_norm:.2f} | Tok/s: {toks_sec_avg:,.0f}"
-            if pbar:
-                pbar.write(msg)
-            else:
-                print(msg)
-            flog.log(msg)
-            if writer:
-                writer.add_scalar("bert/train_loss", accum_loss, step)
-                writer.add_scalar("bert/lr", lr, step)
-                writer.add_scalar("bert/grad_norm", grad_norm, step)
-                writer.add_scalar("bert/tokens_per_sec", toks_sec_avg, step)
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            log_line = (
+                f"[{ts}] STEP {step:>6d}/{config.max_iters} | "
+                f"Tokens: {tokens_processed:>11,d} | "
+                f"loss={accum_loss:.4f} | "
+                f"ppl={ppl:.2f} | "
+                f"lr={lr:.2e} | "
+                f"grad_norm={grad_norm:.3f} | "
+                f"tok/s={toks_sec:,.0f}"
+            )
+            print(log_line, flush=True)
+
+            # Structured file and TensorBoard logging every 50 steps
+            if step % config.log_interval == 0:
+                flog.log(log_line)
+                if writer:
+                    writer.add_scalar("bert/train_loss", accum_loss, step)
+                    writer.add_scalar("bert/lr", lr, step)
+                    writer.add_scalar("bert/grad_norm", grad_norm, step)
+                    writer.add_scalar("bert/tokens_per_sec", toks_sec, step)
 
         t0 = t1
 
