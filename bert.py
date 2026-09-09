@@ -70,8 +70,8 @@ class BertConfig:
     grad_clip: float = 1.0
 
     # Batching & Accumulation
-    batch_size: int = 16           # Micro-batch per GPU (scales memory up to ~12.2GB on 15GB T4)
-    gradient_accumulation_steps: int = 2  # 16 * 2 * 2 GPUs * 1024 tokens = 65,536 tokens/step
+    batch_size: int = 8            # Micro-batch per GPU (safe 8.7GB on 15GB T4)
+    gradient_accumulation_steps: int = 4  # 8 * 4 * 2 GPUs * 1024 tokens = 65,536 tokens/step
     mask_prob: float = 0.20        # 20% dynamic masking (ModernBERT standard)
 
     # Logging & Checkpointing
