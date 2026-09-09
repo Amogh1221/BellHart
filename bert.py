@@ -75,7 +75,7 @@ class BertConfig:
     mask_prob: float = 0.20        # 20% dynamic masking (ModernBERT standard)
 
     # Logging & Checkpointing
-    log_interval: int = 10
+    log_interval: int = 1          # Log every single iteration
     eval_interval: int = 500
     eval_iters: int = 20
     save_interval: int = 200       # Checkpoint every 200 steps on Kaggle
