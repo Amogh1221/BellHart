@@ -75,7 +75,7 @@ class BertConfig:
     mask_prob: float = 0.20        # 20% dynamic masking (ModernBERT standard)
 
     # Logging & Checkpointing
-    log_interval: int = 1          # Log every single iteration
+    log_interval: int = 50         # Log to file and TensorBoard every 50 steps
     eval_interval: int = 500
     eval_iters: int = 20
     save_interval: int = 200       # Checkpoint every 200 steps on Kaggle
@@ -717,6 +717,7 @@ def main():
         pbar = None
 
     t0 = time.time()
+    t_interval_start = t0
     while step < config.max_iters:
         lr = get_lr(step, config)
         for pg in optimizer.param_groups:
@@ -754,25 +755,38 @@ def main():
             optimizer.step()
 
         step += 1
+        t1 = time.time()
+        dt_step = max(t1 - t0, 1e-6)
+        toks_sec_live = tokens_per_step / dt_step
+
+        # Live terminal screen update every single step
         if pbar:
             pbar.update(1)
+            pbar.set_postfix({
+                "loss": f"{accum_loss:.3f}",
+                "lr": f"{lr:.2e}",
+                "tok/s": f"{toks_sec_live:,.0f}"
+            })
 
-        # Logging
+        # Structured milestone log & file write every 50 steps
         if step % config.log_interval == 0 and is_master:
-            t1 = time.time()
-            dt = t1 - t0
-            t0 = t1
-            toks_sec = (config.log_interval * tokens_per_step) / max(dt, 1e-6)
+            dt_50 = t1 - t_interval_start
+            t_interval_start = t1
+            toks_sec_avg = (config.log_interval * tokens_per_step) / max(dt_50, 1e-6)
             ppl = math.exp(min(accum_loss, 20.0))
-            msg = f"STEP {step:6d}/{config.max_iters} | Loss: {accum_loss:.4f} | PPL: {ppl:.2f} | LR: {lr:.2e} | Norm: {grad_norm:.2f} | Tok/s: {toks_sec:,.0f}"
+            msg = f"STEP {step:6d}/{config.max_iters} | Loss: {accum_loss:.4f} | PPL: {ppl:.2f} | LR: {lr:.2e} | Norm: {grad_norm:.2f} | Tok/s: {toks_sec_avg:,.0f}"
             if pbar:
-                pbar.set_postfix({"loss": f"{accum_loss:.3f}", "tok/s": f"{toks_sec:,.0f}"})
+                pbar.write(msg)
+            else:
+                print(msg)
             flog.log(msg)
             if writer:
                 writer.add_scalar("bert/train_loss", accum_loss, step)
                 writer.add_scalar("bert/lr", lr, step)
                 writer.add_scalar("bert/grad_norm", grad_norm, step)
-                writer.add_scalar("bert/tokens_per_sec", toks_sec, step)
+                writer.add_scalar("bert/tokens_per_sec", toks_sec_avg, step)
+
+        t0 = t1
 
         # Evaluation & Checkpoint saving (every 200 steps on Kaggle)
         if step % config.save_interval == 0 or step == config.max_iters:
