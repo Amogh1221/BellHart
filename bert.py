@@ -450,6 +450,28 @@ class BertStreamingDataset(IterableDataset):
 # 4. Learning Rate Schedule & Logger
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _format_eta(seconds: float) -> str:
+    """Format remaining seconds into human-readable ETA string."""
+    if seconds < 0:
+        return "N/A"
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    if days > 0:
+        return f"{days}d {hours}h {minutes}m"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _format_elapsed(seconds: float) -> str:
+    """Format elapsed seconds as HH:MM:SS."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def get_lr(it: int, config: BertConfig) -> float:
     if it < config.warmup_iters:
         return config.learning_rate * (it + 1) / (config.warmup_iters + 1)
@@ -739,8 +761,11 @@ def main():
     if is_master:
         print(f"[BERT] Commencing 150,000 steps (~{tokens_per_step:,} tokens/step)...", flush=True)
 
-    t0 = time.time()
-    t_interval_start = t0
+    start_time = time.time()
+    steps_taken_since_resume = 0
+    t0 = start_time
+    t_interval_start = start_time
+
     while step < config.max_iters:
         lr = get_lr(step, config)
         for pg in optimizer.param_groups:
@@ -778,12 +803,20 @@ def main():
             optimizer.step()
 
         step += 1
+        steps_taken_since_resume += 1
         t1 = time.time()
         dt_step = max(t1 - t0, 1e-6)
         toks_sec = tokens_per_step / dt_step
         tokens_processed = step * tokens_per_step
 
-        # Print to terminal every single step with immediate flush (exactly like BellHart)
+        # Dynamic ETA calculation
+        elapsed = t1 - start_time
+        sec_per_step = elapsed / max(steps_taken_since_resume, 1)
+        steps_remaining = config.max_iters - step
+        eta_seconds = steps_remaining * sec_per_step
+        eta_str = _format_eta(eta_seconds)
+
+        # Print to terminal every single step with immediate flush (with ETA like BellHart)
         if is_master:
             ppl = math.exp(min(accum_loss, 20.0))
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -794,7 +827,8 @@ def main():
                 f"ppl={ppl:.2f} | "
                 f"lr={lr:.2e} | "
                 f"grad_norm={grad_norm:.3f} | "
-                f"tok/s={toks_sec:,.0f}"
+                f"tok/s={toks_sec:,.0f} | "
+                f"ETA: {eta_str}"
             )
             print(log_line, flush=True)
 
@@ -813,15 +847,35 @@ def main():
         if step % config.save_interval == 0 or step == config.max_iters:
             val_loss = evaluate_bert(model, val_loader, config.eval_iters, dtype)
             val_ppl = math.exp(min(val_loss, 20.0))
+            is_best = val_loss < best_val_loss
+            delta_val = val_loss - best_val_loss if best_val_loss < float("inf") else 0.0
+            delta_str = f"Δ: {delta_val:+.4f}" if not is_best else "NEW BEST ★"
+            pct = (step / config.max_iters) * 100
+
             if is_master:
-                eval_msg = f"── EVAL @ Step {step} | Val Loss: {val_loss:.4f} | Val PPL: {val_ppl:.2f} ──"
-                print(f"\n{eval_msg}")
-                flog.log(eval_msg)
+                hr = "═" * 56
+                eval_str = (
+                    f"\n{hr}\n"
+                    f"  BERT EVALUATION @ Step {step} / {config.max_iters}   ({pct:.1f}%)\n"
+                    f"{hr}\n"
+                    f"  Tokens Processed : {tokens_processed:,}\n"
+                    f"  Train Loss       : {accum_loss:.4f}\n"
+                    f"  Val Loss         : {val_loss:.4f}  (best: {best_val_loss:.4f}  {delta_str})\n"
+                    f"  Perplexity       : {val_ppl:.2f}\n"
+                    f"  Learning Rate    : {lr:.2e}\n"
+                    f"  Grad Norm        : {grad_norm:.3f}\n"
+                    f"  Tokens/sec       : {toks_sec:,.0f}\n"
+                    f"  Elapsed          : {_format_elapsed(elapsed)}\n"
+                    f"  ETA              : {eta_str}\n"
+                    f"{hr}\n"
+                )
+                print(eval_str, flush=True)
+                flog.log(eval_str)
                 if writer:
                     writer.add_scalar("bert/val_loss", val_loss, step)
                     writer.add_scalar("bert/val_ppl", val_ppl, step)
 
-            if val_loss < best_val_loss:
+            if is_best:
                 best_val_loss = val_loss
 
             save_bert_checkpoint(
