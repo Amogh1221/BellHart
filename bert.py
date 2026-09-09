@@ -50,10 +50,10 @@ from tokenizer import Tokenizer
 class BertConfig:
     # Architecture
     vocab_size: int = 32768
-    n_embd: int = 512
-    n_head: int = 8                # Head dimension: 512 / 8 = 64
+    n_embd: int = 768              # ModernBERT-Base standard width (768 hidden dimension)
+    n_head: int = 12               # Head dimension: 768 / 12 = 64 (Tensor Core optimal)
     n_layer: int = 12              # 12-layer hierarchical abstraction
-    intermediate_size: int = 1376  # SwiGLU hidden dimension (~2.68x n_embd, multiple of 64)
+    intermediate_size: int = 2048  # SwiGLU hidden dimension (~2.67x n_embd, multiple of 256)
     block_size: int = 1024         # Sequence length (2048 maximum supported via RoPE)
     rope_theta: float = 500000.0   # RoPE base theta matching BellHart
     norm_eps: float = 1e-5
@@ -61,8 +61,8 @@ class BertConfig:
 
     # Training & Optimization
     max_iters: int = 150000        # 150,000 pre-training steps
-    learning_rate: float = 1e-3    # Peak LR (ModernBERT / BERT encoders train optimally at 1e-3)
-    min_lr: float = 1e-4           # Final decayed LR (10% of peak)
+    learning_rate: float = 6e-4    # Peak LR scaled for 768-dim encoder (RoBERTa / ModernBERT standard)
+    min_lr: float = 6e-5           # Final decayed LR (10% of peak)
     warmup_iters: int = 3000       # Linear warmup steps
     weight_decay: float = 0.01     # Decoupled weight decay
     beta1: float = 0.90
@@ -70,8 +70,8 @@ class BertConfig:
     grad_clip: float = 1.0
 
     # Batching & Accumulation
-    batch_size: int = 8            # Micro-batch per GPU (safe 8.7GB on 15GB T4)
-    gradient_accumulation_steps: int = 4  # 8 * 4 * 2 GPUs * 1024 tokens = 65,536 tokens/step
+    batch_size: int = 4            # Micro-batch per GPU (safe memory on 15GB T4 with 768-dim)
+    gradient_accumulation_steps: int = 8  # 4 * 8 * 2 GPUs * 1024 tokens = 65,536 tokens/step
     mask_prob: float = 0.20        # 20% dynamic masking (ModernBERT standard)
 
     # Logging & Checkpointing
