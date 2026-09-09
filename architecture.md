@@ -26,40 +26,55 @@ BellHart is a **619.8-Million parameter**, 52-layer deep-reasoning autoregressiv
 
 ## 2. Core Architectural Innovations
 
-```
-                              ┌────────────────────────────────────────┐
-                              │           Input Tokens (idx)           │
-                              └───────────────────┬────────────────────┘
-                                                  │
-                                   wte(idx) * sqrt(d_model)  [Tied Embedding]
-                                                  │
-                ┌─────────────────────────────────▼──────────────────────────────────┐
-                │                         52 Transformer Blocks                      │
-                │                                                                    │
-                │   Block 0 ───┐ [Shortcut: x_0]                  ┌───> Block 51     │
-                │   Block 1 ───┼───┐ [Shortcut: x_1]          ┌───┼───> Block 50     │
-                │   Block 2 ───┼───┼───┐                  ┌───┼───┼───> Block 49     │
-                │      ...     │   │   │                  │   │   │       ...        │
-                │              │   │   │  [U-Net Skips]   │   │   │                  │
-                │              │   │   └──> (x_i + x_j) <─┘   │   │                  │
-                │              │   └──────> (x_i + x_j) <─────┘   │                  │
-                │              └──────────> (x_i + x_j) <─────────┘                  │
-                │                                                                    │
-                │   Inside Each Block:                                               │
-                │   x ──> RMSNorm ──> QK-Norm GQA + RoPE + Res-V ──(+)──> RMSNorm   │
-                │                                                    │       │       │
-                │                                                    │    SwiGLU     │
-                │                                                    │       │       │
-                │                                                    └──────(+)──> x │
-                └─────────────────────────────────┬──────────────────────────────────┘
-                                                  │
-                                             Final RMSNorm
-                                                  │
-                                         lm_head (Tied wte)
-                                                  │
-                                      Logit Soft-Capping (tanh)
-                                                  │
-                                            Cross-Entropy
+```mermaid
+graph TD
+    %% Global Inputs
+    Tokens["Input Tokens (idx)"] --> Emb["wte(idx) × √d_model<br><i>Tied Embedding (PaLM / Gemma 2)</i>"]
+
+    subgraph Blocks["52 Transformer Decoder Blocks (U-Net Symmetric Topology)"]
+        direction TB
+
+        %% First Half Blocks
+        B0["Block 0<br><i>RMSNorm + GQA + SwiGLU</i>"]
+        B1["Block 1<br><i>RMSNorm + GQA + SwiGLU</i>"]
+        B_early["... (Blocks 2 to 25) ..."]
+
+        %% Second Half Blocks
+        B_late["... (Blocks 26 to 49) ..."]
+        B50["Block 50<br><i>x = x + Shortcut_1</i>"]
+        B51["Block 51<br><i>x = x + Shortcut_0</i>"]
+
+        %% Sequential Forward Flow
+        B0 --> B1 --> B_early --> B_late --> B50 --> B51
+
+        %% U-Net Long-Range Skip Connections
+        B0 -.->|"U-Net Skip Shortcut 0"| B51
+        B1 -.->|"U-Net Skip Shortcut 1"| B50
+
+        %% Cross-Layer Value-Residual
+        B0 ==>|"Res-V: 0.5·V_l + 0.5·V_prev"| B1
+    end
+
+    Emb --> B0
+    B51 --> LN_F["Final RMSNorm (norm_eps=1e-5)"]
+    LN_F --> LMHead["lm_head (Tied Weights wte)"]
+    LMHead --> SoftCap["Logit Soft-Capping<br><i>30.0 × tanh(logits / 30.0)</i>"]
+    SoftCap --> Loss["Cross-Entropy Loss / Softmax"]
+
+    %% Block Internal Subgraph
+    subgraph InsideBlock["Inside Each Block (Modern GQA Transformer Layer)"]
+        direction LR
+        InX["Input x"] --> Norm1["RMSNorm"]
+        Norm1 --> Attn["QK-Norm + RoPE (θ=500k)<br>+ GQA (16:4) + Res-V"]
+        InX --> Add1(("+"))
+        Attn --> Add1
+
+        Add1 --> Norm2["RMSNorm"]
+        Norm2 --> FFN["SwiGLU FFN<br><i>down_proj(SiLU(gate) · up)</i>"]
+        Add1 --> Add2(("+"))
+        FFN --> Add2
+        Add2 --> OutX["Output x"]
+    end
 ```
 
 ---
