@@ -760,6 +760,14 @@ def main():
 
     if is_master:
         print(f"[BERT] Commencing 150,000 steps (~{tokens_per_step:,} tokens/step)...", flush=True)
+        pbar = tqdm(
+            total=config.max_iters,
+            initial=step,
+            desc="BERT Training",
+            dynamic_ncols=True,
+        )
+    else:
+        pbar = None
 
     start_time = time.time()
     steps_taken_since_resume = 0
@@ -775,6 +783,9 @@ def main():
         accum_loss = 0.0
 
         for micro in range(config.gradient_accumulation_steps):
+            if pbar:
+                pbar.set_description(f"BERT Training (Micro {micro + 1}/{config.gradient_accumulation_steps})")
+
             x, y = next(train_iter)
             x, y = x.cuda(non_blocking=True), y.cuda(non_blocking=True)
 
@@ -815,10 +826,21 @@ def main():
         steps_remaining = config.max_iters - step
         eta_seconds = steps_remaining * sec_per_step
         eta_str = _format_eta(eta_seconds)
+        ppl = math.exp(min(accum_loss, 20.0))
 
-        # Print to terminal every single step with immediate flush (with ETA like BellHart)
-        if is_master:
-            ppl = math.exp(min(accum_loss, 20.0))
+        # Update tqdm live every single iteration (shows it/s or s/it automatically)
+        if pbar:
+            pbar.update(1)
+            pbar.set_postfix({
+                "loss": f"{accum_loss:.4f}",
+                "ppl": f"{ppl:.1f}",
+                "lr": f"{lr:.2e}",
+                "tok/s": f"{toks_sec:,.0f}",
+                "eta": eta_str,
+            })
+
+        # Structured milestone log written cleanly above pbar every 50 steps
+        if step % config.log_interval == 0 and is_master:
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
             log_line = (
                 f"[{ts}] STEP {step:>6d}/{config.max_iters} | "
@@ -830,16 +852,17 @@ def main():
                 f"tok/s={toks_sec:,.0f} | "
                 f"ETA: {eta_str}"
             )
-            print(log_line, flush=True)
+            if pbar:
+                pbar.write(log_line)
+            else:
+                print(log_line, flush=True)
 
-            # Structured file and TensorBoard logging every 50 steps
-            if step % config.log_interval == 0:
-                flog.log(log_line)
-                if writer:
-                    writer.add_scalar("bert/train_loss", accum_loss, step)
-                    writer.add_scalar("bert/lr", lr, step)
-                    writer.add_scalar("bert/grad_norm", grad_norm, step)
-                    writer.add_scalar("bert/tokens_per_sec", toks_sec, step)
+            flog.log(log_line)
+            if writer:
+                writer.add_scalar("bert/train_loss", accum_loss, step)
+                writer.add_scalar("bert/lr", lr, step)
+                writer.add_scalar("bert/grad_norm", grad_norm, step)
+                writer.add_scalar("bert/tokens_per_sec", toks_sec, step)
 
         t0 = t1
 
@@ -869,7 +892,10 @@ def main():
                     f"  ETA              : {eta_str}\n"
                     f"{hr}\n"
                 )
-                print(eval_str, flush=True)
+                if pbar:
+                    pbar.write(eval_str)
+                else:
+                    print(eval_str, flush=True)
                 flog.log(eval_str)
                 if writer:
                     writer.add_scalar("bert/val_loss", val_loss, step)
