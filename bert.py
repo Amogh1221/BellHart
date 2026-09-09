@@ -534,11 +534,24 @@ def save_bert_checkpoint(
     torch.save(state, latest_path)
     print(f"\n[BERT] Checkpoint saved: {ckpt_path} (Val Loss: {val_loss:.4f})")
 
-    # Async HuggingFace backup
+    # Local retention: keep only the latest 3 numbered checkpoints on disk
+    local_ckpts = sorted(
+        Path("bert_checkpoints").glob("bert-[0-9]*.pt"),
+        key=lambda p: p.stat().st_mtime
+    )
+    if len(local_ckpts) > 3:
+        for old_p in local_ckpts[:-3]:
+            try:
+                old_p.unlink()
+            except Exception:
+                pass
+
+    # Async HuggingFace backup (keeps latest 3 numbered checkpoints + latest_bert.pt)
     if hf_token and repo_id:
         def _upload():
             try:
-                from huggingface_hub import HfApi, CommitOperationAdd
+                import re
+                from huggingface_hub import HfApi, CommitOperationAdd, CommitOperationDelete
                 api = HfApi(token=hf_token)
                 ops = [
                     CommitOperationAdd(path_in_repo=ckpt_path, path_or_fileobj=ckpt_path),
@@ -548,11 +561,24 @@ def save_bert_checkpoint(
                 if os.path.exists(log_file):
                     ops.append(CommitOperationAdd(path_in_repo=log_file, path_or_fileobj=log_file))
 
+                # Check remote checkpoints and delete older ones beyond the latest 3
+                try:
+                    files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+                    remote_ckpts = [f for f in files if re.match(r"^bert_checkpoints/bert-\d+\.pt$", f)]
+                    remote_ckpts.sort(key=lambda x: int(re.search(r"bert-(\d+)\.pt", x).group(1)))
+                    # Keep at most 2 old ones since we are adding 1 new one
+                    if len(remote_ckpts) >= 3:
+                        to_delete = remote_ckpts[: len(remote_ckpts) - 2]
+                        for f in to_delete:
+                            ops.append(CommitOperationDelete(path_in_repo=f))
+                except Exception as e:
+                    print(f"[BERT HF List Note] {e}")
+
                 api.create_commit(
                     repo_id=repo_id,
                     repo_type="dataset",
                     operations=ops,
-                    commit_message=f"[BERT] Upload Checkpoint Step {step}",
+                    commit_message=f"[BERT] Upload Checkpoint Step {step} (Retain Latest 3)",
                 )
             except Exception as e:
                 print(f"[BERT HF Upload Error] {e}")
