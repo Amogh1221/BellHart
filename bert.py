@@ -38,6 +38,11 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from huggingface_hub.utils import disable_progress_bars
+
+# Suppress Hugging Face download/upload progress bars from flooding the terminal
+disable_progress_bars()
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 from tokenizer import Tokenizer
 
@@ -544,68 +549,77 @@ def save_bert_checkpoint(
     latest_path = "bert_checkpoints/latest_bert.pt"
 
     base_model = model.module if hasattr(model, "module") else model
+    # Clone state_dict to CPU so the main training loop can immediately continue on GPU
     state = {
-        "model_state_dict": base_model.state_dict(),
+        "model_state_dict": {k: v.cpu().clone() for k, v in base_model.state_dict().items()},
         "optimizer_state_dict": optimizer.state_dict(),
         "step": step,
         "val_loss": val_loss,
         "config": asdict(config),
         "dataset_state": train_dataset.state_dict(),
     }
-    torch.save(state, ckpt_path)
-    torch.save(state, latest_path)
-    print(f"\n[BERT] Checkpoint saved: {ckpt_path} (Val Loss: {val_loss:.4f})")
 
-    # Local retention: keep only the latest 3 numbered checkpoints on disk
-    local_ckpts = sorted(
-        Path("bert_checkpoints").glob("bert-[0-9]*.pt"),
-        key=lambda p: p.stat().st_mtime
-    )
-    if len(local_ckpts) > 3:
-        for old_p in local_ckpts[:-3]:
-            try:
-                old_p.unlink()
-            except Exception:
-                pass
+    # Offload all disk I/O and Hugging Face uploading to background thread
+    def _background_save_and_sync():
+        try:
+            torch.save(state, ckpt_path)
+            torch.save(state, latest_path)
 
-    # Async HuggingFace backup (keeps latest 3 numbered checkpoints + latest_bert.pt)
-    if hf_token and repo_id:
-        def _upload():
-            try:
-                import re
-                from huggingface_hub import HfApi, CommitOperationAdd, CommitOperationDelete
-                api = HfApi(token=hf_token)
-                ops = [
-                    CommitOperationAdd(path_in_repo=ckpt_path, path_or_fileobj=ckpt_path),
-                    CommitOperationAdd(path_in_repo=latest_path, path_or_fileobj=latest_path),
-                ]
-                log_file = "bert_logs/bert_training_log.txt"
-                if os.path.exists(log_file):
-                    ops.append(CommitOperationAdd(path_in_repo=log_file, path_or_fileobj=log_file))
+            # Local retention: keep only the latest 3 numbered checkpoints on disk
+            local_ckpts = sorted(
+                Path("bert_checkpoints").glob("bert-[0-9]*.pt"),
+                key=lambda p: p.stat().st_mtime
+            )
+            if len(local_ckpts) > 3:
+                for old_p in local_ckpts[:-3]:
+                    try:
+                        old_p.unlink()
+                    except Exception:
+                        pass
 
-                # Check remote checkpoints and delete older ones beyond the latest 3
+            # Hugging Face cloud backup
+            if hf_token and repo_id:
                 try:
-                    files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
-                    remote_ckpts = [f for f in files if re.match(r"^bert_checkpoints/bert-\d+\.pt$", f)]
-                    remote_ckpts.sort(key=lambda x: int(re.search(r"bert-(\d+)\.pt", x).group(1)))
-                    # Keep at most 2 old ones since we are adding 1 new one
-                    if len(remote_ckpts) >= 3:
-                        to_delete = remote_ckpts[: len(remote_ckpts) - 2]
-                        for f in to_delete:
-                            ops.append(CommitOperationDelete(path_in_repo=f))
+                    import re
+                    from huggingface_hub import HfApi, CommitOperationAdd, CommitOperationDelete
+                    from huggingface_hub.utils import disable_progress_bars
+                    disable_progress_bars()
+
+                    api = HfApi(token=hf_token)
+                    ops = [
+                        CommitOperationAdd(path_in_repo=ckpt_path, path_or_fileobj=ckpt_path),
+                        CommitOperationAdd(path_in_repo=latest_path, path_or_fileobj=latest_path),
+                    ]
+                    log_file = "bert_logs/bert_training_log.txt"
+                    if os.path.exists(log_file):
+                        ops.append(CommitOperationAdd(path_in_repo=log_file, path_or_fileobj=log_file))
+
+                    # Check remote checkpoints and delete older ones beyond the latest 3
+                    try:
+                        files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+                        remote_ckpts = [f for f in files if re.match(r"^bert_checkpoints/bert-\d+\.pt$", f)]
+                        remote_ckpts.sort(key=lambda x: int(re.search(r"bert-(\d+)\.pt", x).group(1)))
+                        if len(remote_ckpts) >= 3:
+                            to_delete = remote_ckpts[: len(remote_ckpts) - 2]
+                            for f in to_delete:
+                                ops.append(CommitOperationDelete(path_in_repo=f))
+                    except Exception:
+                        pass
+
+                    api.create_commit(
+                        repo_id=repo_id,
+                        repo_type="dataset",
+                        operations=ops,
+                        commit_message=f"[BERT] Upload Checkpoint Step {step} (Retain Latest 3)",
+                    )
                 except Exception as e:
-                    print(f"[BERT HF List Note] {e}")
+                    print(f"\n[BERT HF Sync Error] {e}\n", flush=True)
 
-                api.create_commit(
-                    repo_id=repo_id,
-                    repo_type="dataset",
-                    operations=ops,
-                    commit_message=f"[BERT] Upload Checkpoint Step {step} (Retain Latest 3)",
-                )
-            except Exception as e:
-                print(f"[BERT HF Upload Error] {e}")
+            print("\n======SAVED======\n", flush=True)
+        except Exception as e:
+            print(f"\n[BERT Save Error] {e}\n", flush=True)
 
-        threading.Thread(target=_upload, daemon=True).start()
+    threading.Thread(target=_background_save_and_sync, daemon=True).start()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
