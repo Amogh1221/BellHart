@@ -494,10 +494,10 @@ class BertFileLogger:
         self.log_file = Path(log_dir) / "bert_training_log.txt"
 
     def log(self, message: str):
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{ts}] {message}\n"
         with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(line)
+            if not message.endswith("\n"):
+                message = message + "\n"
+            f.write(message)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -505,7 +505,7 @@ class BertFileLogger:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def sync_bert_huggingface(repo_id: str, is_master: bool = True):
-    """Pulls latest BERT checkpoint from HuggingFace dataset repo."""
+    """Pulls latest BERT checkpoint and persistent training logs from HuggingFace dataset repo."""
     os.makedirs("bert_checkpoints", exist_ok=True)
     os.makedirs("bert_logs", exist_ok=True)
     if not is_master:
@@ -540,8 +540,21 @@ def sync_bert_huggingface(repo_id: str, is_master: bool = True):
                 shutil.copy2(latest, "bert_checkpoints/latest_bert.pt")
                 print(f"[BERT] Linked {latest} -> bert_checkpoints/latest_bert.pt")
 
+        # 3. Download persistent training log if available
+        if "bert_logs/bert_training_log.txt" in files:
+            print("[BERT] Downloading persistent training log from HuggingFace...")
+            hf_hub_download(
+                repo_id=repo_id,
+                filename="bert_logs/bert_training_log.txt",
+                repo_type="dataset",
+                local_dir=".",
+            )
+            print("[BERT] Successfully downloaded bert_logs/bert_training_log.txt")
+        else:
+            print("[BERT] No existing bert_logs/bert_training_log.txt found on HuggingFace.")
+
     except Exception as e:
-        print(f"[BERT] Checkpoint sync note: {e}")
+        print(f"[BERT] Checkpoint / Log sync note: {e}")
 
 
 def save_bert_checkpoint(
@@ -601,32 +614,54 @@ def save_bert_checkpoint(
                     disable_progress_bars()
 
                     api = HfApi(token=hf_token)
-                    ops = [
+                    max_ckpt = 3
+                    upload_ops = [
                         CommitOperationAdd(path_in_repo=ckpt_path, path_or_fileobj=ckpt_path),
                         CommitOperationAdd(path_in_repo=latest_path, path_or_fileobj=latest_path),
                     ]
                     log_file = "bert_logs/bert_training_log.txt"
                     if os.path.exists(log_file):
-                        ops.append(CommitOperationAdd(path_in_repo=log_file, path_or_fileobj=log_file))
-
-                    # Check remote checkpoints and delete older ones beyond the latest 3
-                    try:
-                        files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
-                        remote_ckpts = [f for f in files if re.match(r"^bert_checkpoints/bert-\d+\.pt$", f)]
-                        remote_ckpts.sort(key=lambda x: int(re.search(r"bert-(\d+)\.pt", x).group(1)))
-                        if len(remote_ckpts) >= 3:
-                            to_delete = remote_ckpts[: len(remote_ckpts) - 2]
-                            for f in to_delete:
-                                ops.append(CommitOperationDelete(path_in_repo=f))
-                    except Exception:
-                        pass
+                        upload_ops.append(CommitOperationAdd(path_in_repo=log_file, path_or_fileobj=log_file))
 
                     api.create_commit(
                         repo_id=repo_id,
                         repo_type="dataset",
-                        operations=ops,
-                        commit_message=f"[BERT] Upload Checkpoint Step {step} (Retain Latest 3)",
+                        operations=upload_ops,
+                        commit_message=f"[BERT] Upload Checkpoint Step {step} and logs",
                     )
+
+                    # Clean up old checkpoints from remote repository and squash history to prevent LFS storage bloat
+                    try:
+                        files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+                        remote_ckpts = [f for f in files if re.match(r"^bert_checkpoints/bert-\d+\.pt$", f)]
+                        remote_ckpts.sort(key=lambda x: int(re.search(r"bert-(\d+)\.pt", x).group(1)))
+                        delete_ops = []
+                        if len(remote_ckpts) > max_ckpt:
+                            to_delete = remote_ckpts[:-max_ckpt]
+                            for f in to_delete:
+                                delete_ops.append(CommitOperationDelete(path_in_repo=f))
+
+                        if len(delete_ops) > 0:
+                            api.create_commit(
+                                repo_id=repo_id,
+                                repo_type="dataset",
+                                operations=delete_ops,
+                                commit_message=f"[BERT] Cleanup old checkpoints (keeping latest {max_ckpt})",
+                            )
+
+                            # Squash Git LFS history to eliminate phantom storage bloat
+                            if hasattr(api, "super_squash_history"):
+                                try:
+                                    api.super_squash_history(
+                                        repo_id=repo_id,
+                                        repo_type="dataset",
+                                        commit_message="Squash history to prevent LFS storage bloat",
+                                    )
+                                except Exception as e:
+                                    print(f"[BERT] Failed to squash history: {e}")
+                    except Exception as e:
+                        print(f"[BERT HF Cleanup Error] {e}", flush=True)
+
                 except Exception as e:
                     print(f"\n[BERT HF Sync Error] {e}\n", flush=True)
 
