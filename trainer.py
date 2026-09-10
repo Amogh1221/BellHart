@@ -23,6 +23,7 @@ import re
 import uuid
 import logging
 import threading
+import queue
 from dataclasses import asdict
 from datetime import datetime
 
@@ -226,6 +227,86 @@ class FileLogger:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Background Stream Prefetcher (Zero Extra GPU VRAM)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class BackgroundPrefetcher:
+    """
+    Prefetches batches from an IterableDataset DataLoader in a background daemon thread
+    and keeps a small queue of pinned tensors in host CPU RAM.
+    
+    Eliminates data-loading and tokenization stalls from the GPU training loop,
+    smoothing GPU utilization up to ~90-100% without consuming any extra GPU VRAM.
+    """
+
+    def __init__(self, loader, device: torch.device, maxsize: int = 3):
+        self.loader = loader
+        self.device = device
+        self.maxsize = maxsize
+        self.queue = queue.Queue(maxsize=maxsize)
+        self.stop_event = threading.Event()
+        self.worker = None
+        self._start_worker()
+
+    def _start_worker(self):
+        self.stop_event.clear()
+        self.worker = threading.Thread(target=self._run, daemon=True)
+        self.worker.start()
+
+    def _run(self):
+        loader_iter = iter(self.loader)
+        while not self.stop_event.is_set():
+            try:
+                x, y = next(loader_iter)
+            except StopIteration:
+                loader_iter = iter(self.loader)
+                try:
+                    x, y = next(loader_iter)
+                except Exception:
+                    continue
+            except Exception:
+                time.sleep(0.01)
+                continue
+
+            # Pin memory in host RAM for fast asynchronous DMA PCIe transfer
+            if self.device.type == "cuda" and torch.cuda.is_available():
+                try:
+                    if not x.is_pinned():
+                        x = x.pin_memory()
+                    if not y.is_pinned():
+                        y = y.pin_memory()
+                except Exception:
+                    pass
+
+            while not self.stop_event.is_set():
+                try:
+                    self.queue.put((x, y), timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    def next(self) -> tuple[torch.Tensor, torch.Tensor]:
+        x, y = self.queue.get()
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    def reset(self):
+        """Stops current prefetch thread, flushes queue, and restarts with updated stream state."""
+        self.stop_event.set()
+        if self.worker is not None and self.worker.is_alive():
+            self.worker.join(timeout=1.0)
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        self._start_worker()
+
+    def close(self):
+        self.stop_event.set()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Trainer Main Engine
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -317,8 +398,13 @@ class Trainer:
         self.train_dataset = getattr(train_loader, "dataset", None)
         self.val_dataset = getattr(val_loader, "dataset", None)
 
-        # Data stream iterators (validation iterator is lazily created to save host CPU memory)
-        self.train_iter = iter(self.train_loader)
+        # Threaded background prefetcher for training stream (0 extra VRAM, eliminates CPU data stalls)
+        self.train_prefetcher = (
+            BackgroundPrefetcher(self.train_loader, self.device, maxsize=3)
+            if self.train_loader is not None
+            else None
+        )
+        self.train_iter = iter(self.train_loader) if self.train_prefetcher is None and self.train_loader is not None else None
         self.val_iter = None
 
         # Training step counters
@@ -339,14 +425,19 @@ class Trainer:
     def get_batch(self, split: str = "train") -> tuple[torch.Tensor, torch.Tensor]:
         """
         Retrieves the next (x, y) training or validation batch from streaming dataloaders.
-        Automatically catches stream epoch exhaustion and reinitializes the iterator.
+        Uses background prefetcher for training to eliminate data stalls with 0 extra VRAM.
         """
+        if split == "train" and getattr(self, "train_prefetcher", None) is not None:
+            return self.train_prefetcher.next()
+
         if split == "val" and self.val_loader is not None:
             if self.val_iter is None:
                 self.val_iter = iter(self.val_loader)
             loader_iter = self.val_iter
             raw_loader = self.val_loader
         else:
+            if getattr(self, "train_iter", None) is None and self.train_loader is not None:
+                self.train_iter = iter(self.train_loader)
             loader_iter = self.train_iter
             raw_loader = self.train_loader
 
@@ -663,7 +754,10 @@ class Trainer:
                     if hasattr(self.train_dataset, "seed"):
                         self.train_dataset.seed += (self.iter_num // 1000 + 1)
 
-            self.train_iter = iter(self.train_loader)
+            if getattr(self, "train_prefetcher", None) is not None:
+                self.train_prefetcher.reset()
+            else:
+                self.train_iter = iter(self.train_loader)
 
         del ckpt
         import gc
@@ -787,7 +881,7 @@ class Trainer:
             if pbar:
                 micro = self.micro_step % config.gradient_accumulation_steps
                 if micro == 0: micro = config.gradient_accumulation_steps
-                pbar.set_description(f"Training (Micro {micro}/{config.gradient_accumulation_steps})")
+                pbar.set_description(f"Training (Micro {micro}/{config.gradient_accumulation_steps})", refresh=False)
 
             # ── Optimizer Step Boundary ──────────────────────────────────────
             if self.micro_step % config.gradient_accumulation_steps == 0:
@@ -982,6 +1076,8 @@ class Trainer:
                 if pbar:
                     pbar.update(1)
 
+        if getattr(self, "train_prefetcher", None) is not None:
+            self.train_prefetcher.close()
         if pbar:
             pbar.close()
         self.save_checkpoint("checkpoints/latest.pt", step_num=self.iter_num)
