@@ -881,7 +881,7 @@ class Trainer:
             if pbar:
                 micro = self.micro_step % config.gradient_accumulation_steps
                 if micro == 0: micro = config.gradient_accumulation_steps
-                pbar.set_description(f"Training (Micro {micro}/{config.gradient_accumulation_steps})", refresh=False)
+                pbar.set_description(f"Training (Micro {micro}/{config.gradient_accumulation_steps})")
 
             # ── Optimizer Step Boundary ──────────────────────────────────────
             if self.micro_step % config.gradient_accumulation_steps == 0:
@@ -1074,6 +1074,22 @@ class Trainer:
                 self._steps_taken_since_resume += 1
                 
                 if pbar:
+                    t_now = time.time()
+                    elapsed_now = t_now - start_time
+                    steps_taken = max(self._steps_taken_since_resume, 1)
+                    sec_per_step = elapsed_now / steps_taken
+                    steps_remaining = max(0, config.max_iters - self.iter_num)
+                    eta_str = _format_eta(steps_remaining * sec_per_step)
+                    tok_sec = tokens_per_step / max(sec_per_step, 1e-6)
+                    ppl = math.exp(min(step_loss, 20.0))
+
+                    pbar.set_postfix({
+                        "loss": f"{step_loss:.4f}",
+                        "ppl": f"{ppl:.1f}",
+                        "lr": f"{lr:.2e}",
+                        "tok/s": f"{tok_sec:,.0f}",
+                        "eta": eta_str,
+                    })
                     pbar.update(1)
 
         if getattr(self, "train_prefetcher", None) is not None:
