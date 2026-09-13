@@ -566,89 +566,89 @@ class Trainer:
             if not save_success:
                 return
 
-        # Local checkpoint rotation (keep latest max_ckpt checkpoints)
-        if step_num is not None:
-            try:
-                ckpt_dir = os.path.dirname(path)
-                files = os.listdir(ckpt_dir)
-                ckpt_files = [f for f in files if re.match(r"checkpoint-\d+\.pt", f)]
-                ckpt_files.sort(key=lambda x: int(re.search(r"checkpoint-(\d+)\.pt", x).group(1)))
-                if len(ckpt_files) > max_ckpt:
-                    to_delete = ckpt_files[:-max_ckpt]
-                    for f in to_delete:
-                        os.remove(os.path.join(ckpt_dir, f))
-            except Exception:
-                pass
-
-        # Asynchronous HuggingFace backup in a background worker thread
-        hf_token = os.environ.get("HF_TOKEN")
-        if hf_token:
-            def background_sync():
+            # Local checkpoint rotation (keep latest max_ckpt checkpoints)
+            if step_num is not None:
                 try:
-                    import warnings
-                    from huggingface_hub.utils import disable_progress_bars
-                    disable_progress_bars()
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        from huggingface_hub import CommitOperationAdd, CommitOperationDelete, HfApi
-                        import shutil
-                        import uuid
-                        
-                        api = HfApi(token=hf_token)
-                        repo_id = self.config.hf_repo
-                        
-                        sync_path = f"{path}.{uuid.uuid4().hex}.sync"
-                        shutil.copy2(path, sync_path)
-                        
-                        try:
-                            upload_ops = []
-                            delete_ops = []
+                    ckpt_dir = os.path.dirname(path)
+                    files = os.listdir(ckpt_dir)
+                    ckpt_files = [f for f in files if re.match(r"checkpoint-\d+\.pt", f)]
+                    ckpt_files.sort(key=lambda x: int(re.search(r"checkpoint-(\d+)\.pt", x).group(1)))
+                    if len(ckpt_files) > max_ckpt:
+                        to_delete = ckpt_files[:-max_ckpt]
+                        for f in to_delete:
+                            os.remove(os.path.join(ckpt_dir, f))
+                except Exception:
+                    pass
+
+            # Asynchronous HuggingFace backup in a background worker thread
+            hf_token = os.environ.get("HF_TOKEN")
+            if hf_token:
+                def background_sync():
+                    try:
+                        import warnings
+                        from huggingface_hub.utils import disable_progress_bars
+                        disable_progress_bars()
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            from huggingface_hub import CommitOperationAdd, CommitOperationDelete, HfApi
+                            import shutil
+                            import uuid
                             
-                            # Add historical checkpoint upload
-                            if step_num is not None:
+                            api = HfApi(token=hf_token)
+                            repo_id = self.config.hf_repo
+                            
+                            sync_path = f"{path}.{uuid.uuid4().hex}.sync"
+                            shutil.copy2(path, sync_path)
+                            
+                            try:
+                                upload_ops = []
+                                delete_ops = []
+                                
+                                # Add historical checkpoint upload
+                                if step_num is not None:
+                                    upload_ops.append(CommitOperationAdd(
+                                        path_in_repo=f"checkpoints/checkpoint-{step_num:06d}.pt",
+                                        path_or_fileobj=sync_path
+                                    ))
+                                    
+                                # Update latest.pt pointer
                                 upload_ops.append(CommitOperationAdd(
-                                    path_in_repo=f"checkpoints/checkpoint-{step_num:06d}.pt",
+                                    path_in_repo="checkpoints/latest.pt",
                                     path_or_fileobj=sync_path
                                 ))
-                                
-                            # Update latest.pt pointer
-                            upload_ops.append(CommitOperationAdd(
-                                path_in_repo="checkpoints/latest.pt",
-                                path_or_fileobj=sync_path
-                            ))
 
-                            # Upload persistent training log
-                            if os.path.exists("logs/training_log.txt"):
-                                upload_ops.append(CommitOperationAdd(
-                                    path_in_repo="logs/training_log.txt",
-                                    path_or_fileobj="logs/training_log.txt"
-                                ))
-                                
-                            api.create_commit(
-                                repo_id=repo_id,
-                                repo_type="dataset",
-                                operations=upload_ops,
-                                commit_message=f"Upload checkpoints and logs (Step {step_num if step_num is not None else 'Unknown'})"
-                            )
-                            
-                            # Clean up old checkpoints from remote repository
-                            if step_num is not None:
-                                try:
-                                    files = api.list_repo_files(repo_id, repo_type="dataset")
-                                    ckpt_files = [f for f in files if re.match(r"checkpoints/checkpoint-\d+\.pt", f)]
-                                    ckpt_files.sort(key=lambda x: int(re.search(r"checkpoint-(\d+)\.pt", x).group(1)))
-                                    if len(ckpt_files) > max_ckpt:
-                                        to_delete = ckpt_files[:-max_ckpt]
-                                        for f in to_delete:
-                                            delete_ops.append(CommitOperationDelete(path_in_repo=f))
-                                            
-                                    if len(delete_ops) > 0:
-                                        api.create_commit(
-                                            repo_id=repo_id, 
-                                            repo_type="dataset", 
-                                            operations=delete_ops, 
-                                            commit_message=f"Cleanup old checkpoints (keeping latest {max_ckpt})"
-                                        )
+                                # Upload persistent training log
+                                if os.path.exists("logs/training_log.txt"):
+                                    upload_ops.append(CommitOperationAdd(
+                                        path_in_repo="logs/training_log.txt",
+                                        path_or_fileobj="logs/training_log.txt"
+                                    ))
+
+                                api.create_commit(
+                                    repo_id=repo_id,
+                                    repo_type="dataset",
+                                    operations=upload_ops,
+                                    commit_message=f"Upload checkpoints and logs (Step {step_num if step_num is not None else 'Unknown'})"
+                                )
+
+                                # Clean up old checkpoints from remote repository
+                                if step_num is not None:
+                                    try:
+                                        files = api.list_repo_files(repo_id, repo_type="dataset")
+                                        ckpt_files = [f for f in files if re.match(r"checkpoints/checkpoint-\d+\.pt", f)]
+                                        ckpt_files.sort(key=lambda x: int(re.search(r"checkpoint-(\d+)\.pt", x).group(1)))
+                                        if len(ckpt_files) > max_ckpt:
+                                            to_delete = ckpt_files[:-max_ckpt]
+                                            for f in to_delete:
+                                                delete_ops.append(CommitOperationDelete(path_in_repo=f))
+
+                                        if len(delete_ops) > 0:
+                                            api.create_commit(
+                                                repo_id=repo_id, 
+                                                repo_type="dataset", 
+                                                operations=delete_ops, 
+                                                commit_message=f"Cleanup old checkpoints (keeping latest {max_ckpt})"
+                                            )
                                         
                                         # Squash Git LFS history to eliminate phantom storage bloat
                                         if hasattr(api, 'super_squash_history'):
@@ -661,18 +661,18 @@ class Trainer:
                                             except Exception as e:
                                                 print(f"Failed to squash history: {e}")
                                                 
-                                except Exception:
-                                    pass
-                            
-                        finally:
-                            if os.path.exists(sync_path):
-                                os.remove(sync_path)
+                                    except Exception:
+                                        pass
                                 
-                    print("\n======SAVED======\n", flush=True)
-                except Exception as e:
-                    print(f"\n[HF Sync Error] {e}\n", flush=True)
+                            finally:
+                                if os.path.exists(sync_path):
+                                    os.remove(sync_path)
+                                    
+                        print("\n======SAVED======\n", flush=True)
+                    except Exception as e:
+                        print(f"\n[HF Sync Error] {e}\n", flush=True)
 
-            threading.Thread(target=background_sync, daemon=True).start()
+                threading.Thread(target=background_sync, daemon=True).start()
 
     def load_checkpoint(self, path: str):
         """Loads checkpoint into model, optimizer, EMA, and streaming datasets."""
