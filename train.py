@@ -242,11 +242,11 @@ def _train_worker(hf_token: str = "", fresh: bool = False):
         config.block_size = 2048
         config.eval_interval = 500  # Evaluate every 500th step
 
-        # Tiered scaling based on hardware capacity (8-bit AdamW used everywhere for 100% checkpoint portability)
+        # Tiered scaling based on hardware capacity
         if vram_gb >= 140:      # NVIDIA B200 192GB / B300 / H200 141GB (Blackwell / Hopper Max)
             new_batch = 20      # 192GB VRAM: uses ~160GB, zero-checkpointing, max throughput
             config.compile = False
-            config.use_8bit_optimizer = True
+            config.use_8bit_optimizer = False  # Native PyTorch fused AdamW on B200 (~1-2ms step vs ~50ms 8-bit quantization overhead)
             config.gradient_checkpointing = 0  # 192GB VRAM easily fits activations -> 30% faster backprop
             config.save_interval = 500         # Checkpoint every 500 iterations
             config.log_interval = 100          # Log clean summaries every 100 iterations
@@ -303,14 +303,14 @@ def _train_worker(hf_token: str = "", fresh: bool = False):
             config.tf32 = False
 
         # Dynamic streaming shuffle buffer:
-        # B200 / H100 with massive host RAM use 10,000 document shuffle buffer
-        # to ensure diverse batches on single GPU without cluster bias.
+        # Tuned to 1,000 on high-throughput GPUs (B200/H100) to eliminate Python shuffle queue latency
+        # and prevent single-thread CPU token ingestion starvation.
         if vram_gb >= 140:
-            stream_buffer_size = 10000
+            stream_buffer_size = 1000
         elif vram_gb >= 70:
-            stream_buffer_size = 5000
+            stream_buffer_size = 1000
         elif vram_gb >= 35:
-            stream_buffer_size = 2500
+            stream_buffer_size = 1000
         else:
             stream_buffer_size = 1  # Low memory / DDP multi-shard
 

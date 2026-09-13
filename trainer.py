@@ -399,8 +399,9 @@ class Trainer:
         self.val_dataset = getattr(val_loader, "dataset", None)
 
         # Threaded background prefetcher for training stream (0 extra VRAM, eliminates CPU data stalls)
+        prefetch_size = 8 if (self.device.type == "cuda" and torch.cuda.is_available()) else 3
         self.train_prefetcher = (
-            BackgroundPrefetcher(self.train_loader, self.device, maxsize=3)
+            BackgroundPrefetcher(self.train_loader, self.device, maxsize=prefetch_size)
             if self.train_loader is not None
             else None
         )
