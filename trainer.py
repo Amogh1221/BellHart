@@ -459,10 +459,13 @@ class Trainer:
         """
         Estimates cross-entropy loss on train and validation streams without gradient tracking.
         Lazily evaluates validation data and cleans up stream memory immediately afterwards.
+
+        Evaluates a standardized benchmark size (target_eval_sequences = 20, 40,960 tokens) across
+        all hardware tiers to ensure 100% consistent loss comparability whether on T4, L4, or B200.
         """
         out = {}
         self.model.eval()
-        eval_steps = min(max(self.config.eval_iters, 5), 20)
+        target_eval_sequences = 20
 
         splits = ["train"]
         if self.val_loader is not None:
@@ -470,8 +473,13 @@ class Trainer:
 
         for split in splits:
             total_loss = 0.0
-            for k in range(eval_steps):
+            total_sequences = 0
+            while total_sequences < target_eval_sequences:
                 x, y = self.get_batch(split)
+                needed = target_eval_sequences - total_sequences
+                if x.size(0) > needed:
+                    x = x[:needed]
+                    y = y[:needed]
                 with torch.amp.autocast(
                     "cuda",
                     dtype=_DTYPE_MAP.get(self.config.dtype, torch.float16),
@@ -479,10 +487,12 @@ class Trainer:
                 ):
                     logits, _ = self.model(x)
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-                total_loss += loss.item()
+                curr_bs = x.size(0)
+                total_loss += loss.item() * curr_bs
+                total_sequences += curr_bs
                 del logits, loss, x, y
 
-            out[split] = total_loss / max(eval_steps, 1)
+            out[split] = total_loss / max(total_sequences, 1)
 
         if "val" not in out:
             out["val"] = out["train"]

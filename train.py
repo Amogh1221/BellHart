@@ -280,7 +280,7 @@ def _train_worker(hf_token: str = "", fresh: bool = False):
             config.log_interval = 25
 
         base_eval_batches = 20
-        config.eval_iters = max(5, base_eval_batches // new_batch)
+        config.eval_iters = max(1, base_eval_batches // new_batch)
 
         # Re-compute gradient accumulation to maintain constant global batch size across DDP ranks
         if is_ddp:
