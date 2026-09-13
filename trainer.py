@@ -953,7 +953,8 @@ class Trainer:
                             self.writer.add_scalar("train/grad_norm", avg_gn, self.iter_num)
                             self.writer.add_scalar("train/tokens_per_sec", tok_sec, self.iter_num)
 
-                        if self.flog:
+                        # Write to persistent log file every 100 steps (independent of terminal log interval)
+                        if self.flog and (self.iter_num % 100 == 0 or self.iter_num == config.max_iters):
                             self.flog.log_step(
                                 self.iter_num, config.max_iters, avg_loss, lr,
                                 avg_gn, tok_sec, tokens=self._tokens_processed,
