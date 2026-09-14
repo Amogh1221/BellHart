@@ -389,6 +389,7 @@ class Trainer:
                 device_ids=[ddp_local_rank],
                 gradient_as_bucket_view=True,
                 bucket_cap_mb=25,
+                broadcast_buffers=False,
             )
 
         # Create optimizer with separated weight decay parameter groups
@@ -479,12 +480,13 @@ class Trainer:
         to eliminate Hugging Face dataset re-initialization, stream stalls, and host CPU OOM on Kaggle.
         """
         out = {}
-        self.model.eval()
+        base_model = self.model.module if hasattr(self.model, "module") else self.model
+        base_model.eval()
         target_eval_sequences = 20
 
         # In multi-GPU DDP, non-master ranks skip validation evaluation to save CPU RAM and avoid duplicate network calls.
         if self.is_ddp and not self.is_master:
-            self.model.train()
+            base_model.train()
             return {"train": 0.0, "val": 0.0}
 
         # 1. Evaluate Training split (using prefetcher)
@@ -501,7 +503,7 @@ class Trainer:
                 dtype=_DTYPE_MAP.get(self.config.dtype, torch.float16),
                 enabled=(self.device.type == "cuda" and self.config.dtype != "float32"),
             ):
-                logits, _ = self.model(x)
+                logits, _ = base_model(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
             curr_bs = x.size(0)
             total_loss += loss.item() * curr_bs
@@ -542,7 +544,7 @@ class Trainer:
                     dtype=_DTYPE_MAP.get(self.config.dtype, torch.float16),
                     enabled=(self.device.type == "cuda" and self.config.dtype != "float32"),
                 ):
-                    logits, _ = self.model(x)
+                    logits, _ = base_model(x)
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
                 curr_bs = x.size(0)
                 val_loss += loss.item() * curr_bs
@@ -553,7 +555,7 @@ class Trainer:
         else:
             out["val"] = out["train"]
 
-        self.model.train()
+        base_model.train()
         _clean_host_memory()
         return out
 
@@ -1107,6 +1109,12 @@ class Trainer:
                                 "ppl": f"{ppl:.1f}",
                                 "lr": f"{lr:.2e}",
                             })
+
+                    # Synchronize DDP ranks so both ranks enter checkpointing synchronously
+                    if self.is_ddp:
+                        import torch.distributed as dist
+                        if dist.is_initialized():
+                            dist.barrier()
 
                     # Save evaluation checkpoint
                     ckpt_path = f"checkpoints/checkpoint-{self.iter_num + 1:06d}.pt"
