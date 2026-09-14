@@ -132,6 +132,19 @@ def _is_master() -> bool:
     return int(os.environ.get('RANK', 0)) == 0
 
 
+def _clean_host_memory():
+    """Aggressively reclaims host CPU RAM and frees glibc heap arenas to prevent Linux OOM-killer (SIGKILL -9)."""
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Persistent File Logger
 # ──────────────────────────────────────────────────────────────────────────────
@@ -399,7 +412,11 @@ class Trainer:
         self.val_dataset = getattr(val_loader, "dataset", None)
 
         # Threaded background prefetcher for training stream (0 extra VRAM, eliminates CPU data stalls)
-        prefetch_size = 8 if (self.device.type == "cuda" and torch.cuda.is_available()) else 3
+        # Scale prefetch queue based on hardware capacity:
+        # High-memory nodes (B200 / H100 with >= 70GB VRAM) have massive host RAM -> queue 8 for 48k+ tok/s
+        # Memory-constrained GPUs (< 35GB VRAM, e.g. Kaggle T4 / L4) -> queue 2 to strictly cap host RAM under 6.5GB
+        vram_gb = torch.cuda.get_device_properties(self.device).total_memory / 1e9 if (self.device.type == "cuda" and torch.cuda.is_available()) else 0
+        prefetch_size = 8 if vram_gb >= 70 else 2
         self.train_prefetcher = (
             BackgroundPrefetcher(self.train_loader, self.device, maxsize=prefetch_size)
             if self.train_loader is not None
@@ -407,6 +424,7 @@ class Trainer:
         )
         self.train_iter = iter(self.train_loader) if self.train_prefetcher is None and self.train_loader is not None else None
         self.val_iter = None
+        self._cached_val_batches = None
 
         # Training step counters
         self.iter_num = 0
@@ -419,9 +437,8 @@ class Trainer:
         self._tokens_processed = 0
         self._last_log_time = None
 
-        # Reclaim initialization host RAM
-        import gc
-        gc.collect()
+        # Reclaim initialization host RAM and trim glibc heap
+        _clean_host_memory()
 
     def get_batch(self, split: str = "train") -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -458,28 +475,68 @@ class Trainer:
     def estimate_loss(self) -> dict[str, float]:
         """
         Estimates cross-entropy loss on train and validation streams without gradient tracking.
-        Lazily evaluates validation data and cleans up stream memory immediately afterwards.
-
-        Evaluates a standardized benchmark size (target_eval_sequences = 20, 40,960 tokens) across
-        all hardware tiers to ensure 100% consistent loss comparability whether on T4, L4, or B200.
+        Lazily evaluates validation data and permanently caches the 20 benchmark sequences in CPU RAM (640KB)
+        to eliminate Hugging Face dataset re-initialization, stream stalls, and host CPU OOM on Kaggle.
         """
         out = {}
         self.model.eval()
         target_eval_sequences = 20
 
-        splits = ["train"]
-        if self.val_loader is not None:
-            splits.append("val")
+        # In multi-GPU DDP, non-master ranks skip validation evaluation to save CPU RAM and avoid duplicate network calls.
+        if self.is_ddp and not self.is_master:
+            self.model.train()
+            return {"train": 0.0, "val": 0.0}
 
-        for split in splits:
-            total_loss = 0.0
-            total_sequences = 0
-            while total_sequences < target_eval_sequences:
-                x, y = self.get_batch(split)
-                needed = target_eval_sequences - total_sequences
-                if x.size(0) > needed:
-                    x = x[:needed]
-                    y = y[:needed]
+        # 1. Evaluate Training split (using prefetcher)
+        total_loss = 0.0
+        total_sequences = 0
+        while total_sequences < target_eval_sequences:
+            x, y = self.get_batch("train")
+            needed = target_eval_sequences - total_sequences
+            if x.size(0) > needed:
+                x = x[:needed]
+                y = y[:needed]
+            with torch.amp.autocast(
+                "cuda",
+                dtype=_DTYPE_MAP.get(self.config.dtype, torch.float16),
+                enabled=(self.device.type == "cuda" and self.config.dtype != "float32"),
+            ):
+                logits, _ = self.model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            curr_bs = x.size(0)
+            total_loss += loss.item() * curr_bs
+            total_sequences += curr_bs
+            del logits, loss, x, y
+
+        out["train"] = total_loss / max(total_sequences, 1)
+
+        # 2. Evaluate Validation split
+        if self.val_loader is not None or getattr(self, "_cached_val_batches", None) is not None:
+            # Lazy-cache validation sequences in host CPU RAM on first evaluation (takes only 640 KB!)
+            if getattr(self, "_cached_val_batches", None) is None:
+                self._cached_val_batches = []
+                cached_count = 0
+                while cached_count < target_eval_sequences:
+                    x, y = self.get_batch("val")
+                    needed = target_eval_sequences - cached_count
+                    if x.size(0) > needed:
+                        x = x[:needed]
+                        y = y[:needed]
+                    self._cached_val_batches.append((x.cpu(), y.cpu()))
+                    cached_count += x.size(0)
+
+                # Permanently destroy val_loader and streaming iterator to free all Arrow / HF heap buffers
+                self.val_iter = None
+                self.val_loader = None
+                self.val_dataset = None
+                _clean_host_memory()
+
+            # Evaluate fixed cached validation benchmark
+            val_loss = 0.0
+            val_sequences = 0
+            for x_cpu, y_cpu in self._cached_val_batches:
+                x = x_cpu.to(self.device, non_blocking=True)
+                y = y_cpu.to(self.device, non_blocking=True)
                 with torch.amp.autocast(
                     "cuda",
                     dtype=_DTYPE_MAP.get(self.config.dtype, torch.float16),
@@ -488,23 +545,16 @@ class Trainer:
                     logits, _ = self.model(x)
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
                 curr_bs = x.size(0)
-                total_loss += loss.item() * curr_bs
-                total_sequences += curr_bs
+                val_loss += loss.item() * curr_bs
+                val_sequences += curr_bs
                 del logits, loss, x, y
 
-            out[split] = total_loss / max(total_sequences, 1)
-
-        if "val" not in out:
+            out["val"] = val_loss / max(val_sequences, 1)
+        else:
             out["val"] = out["train"]
 
-        # Reset validation stream to free host buffers after evaluation
-        self.val_iter = None
-
         self.model.train()
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _clean_host_memory()
         return out
 
     def save_checkpoint(self, path: str, step_num: int | None = None, max_ckpt: int = 3):
@@ -926,10 +976,9 @@ class Trainer:
                 self._grad_norm_count += 1
                 self._tokens_processed += tokens_per_step
 
-                # Periodic garbage collection to maintain stable host memory
+                # Periodic garbage collection and glibc heap trim to maintain stable host memory
                 if self.iter_num % 500 == 0 and self.iter_num > 0:
-                    import gc
-                    gc.collect()
+                    _clean_host_memory()
 
                 # ── Terminal and File Logging ────────────────────────────────
                 if self.iter_num % config.log_interval == 0 and self.iter_num > 0:

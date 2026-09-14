@@ -235,8 +235,8 @@ def create_streaming_dataloaders(
         buffer_size=1,  # Keep validation evaluation deterministic
         seed=seed + 100_000,
         config_name=dataset_config,
-        rank=rank,
-        world_size=world_size,
+        rank=0,
+        world_size=1,
     )
 
     train_loader = DataLoader(

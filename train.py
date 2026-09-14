@@ -349,8 +349,8 @@ def _train_worker(hf_token: str = "", fresh: bool = False):
         world_size=world_size,
     )
 
-    # Initialize Trainer pipeline
-    trainer = Trainer(config, tokenizer, train_loader, val_loader, is_ddp=is_ddp)
+    # Initialize Trainer pipeline (non-master ranks don't need val_loader in DDP, saving host RAM on Kaggle)
+    trainer = Trainer(config, tokenizer, train_loader, val_loader if is_master else None, is_ddp=is_ddp)
 
     # Check for local checkpoints to resume (bypassed if --fresh is set)
     if not fresh:
