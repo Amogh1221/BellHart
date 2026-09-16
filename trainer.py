@@ -332,7 +332,15 @@ class Trainer:
     distributed data parallel wrapping, evaluation, and checkpoint persistence.
     """
 
-    def __init__(self, config: GPTConfig, tokenizer, train_loader, val_loader, is_ddp: bool = False):
+    def __init__(
+        self,
+        config: GPTConfig,
+        tokenizer,
+        train_loader,
+        val_loader,
+        is_ddp: bool = False,
+        resume_path: Optional[str] = None,
+    ):
         self.config = config
         self.tokenizer = tokenizer
         self.is_ddp = is_ddp
@@ -412,6 +420,23 @@ class Trainer:
         self.train_dataset = getattr(train_loader, "dataset", None)
         self.val_dataset = getattr(val_loader, "dataset", None)
 
+        # Training step counters
+        self.iter_num = 0
+        self.best_val_loss = float("inf")
+        self.micro_step = 0
+
+        # Metric accumulators
+        self._grad_norm_sum = 0.0
+        self._grad_norm_count = 0
+        self._tokens_processed = 0
+        self._last_log_time = None
+
+        # If a checkpoint path is supplied, restore checkpoint BEFORE starting the prefetching thread
+        if resume_path:
+            if self.is_master:
+                print(f"Resuming training from checkpoint: {resume_path}")
+            self.load_checkpoint(resume_path)
+
         # Threaded background prefetcher for training stream (0 extra VRAM, eliminates CPU data stalls)
         # Scale prefetch queue based on hardware capacity:
         # High-memory nodes (B200 / H100 with >= 70GB VRAM) have massive host RAM -> queue 8 for 48k+ tok/s
@@ -426,17 +451,6 @@ class Trainer:
         self.train_iter = iter(self.train_loader) if self.train_prefetcher is None and self.train_loader is not None else None
         self.val_iter = None
         self._cached_val_batches = None
-
-        # Training step counters
-        self.iter_num = 0
-        self.best_val_loss = float("inf")
-        self.micro_step = 0
-
-        # Metric accumulators
-        self._grad_norm_sum = 0.0
-        self._grad_norm_count = 0
-        self._tokens_processed = 0
-        self._last_log_time = None
 
         # Reclaim initialization host RAM and trim glibc heap
         _clean_host_memory()
@@ -482,7 +496,7 @@ class Trainer:
         out = {}
         base_model = self.model.module if hasattr(self.model, "module") else self.model
         base_model.eval()
-        target_eval_sequences = 20
+        target_eval_sequences = 50
 
         # In multi-GPU DDP, non-master ranks skip validation evaluation to save CPU RAM and avoid duplicate network calls.
         if self.is_ddp and not self.is_master:
@@ -811,11 +825,15 @@ class Trainer:
                 self.train_dataset.load_state_dict(ds_state)
                 if self.is_master:
                     print(f"Restored streaming dataset state (chunks yielded: {ds_state.get('chunks_yielded', 'N/A')}, epoch: {ds_state.get('epoch', 0)})")
-            else:
-                if self.iter_num > 0 and self.is_master:
-                    print(f"Note: Checkpoint from step {self.iter_num} has no saved dataset state. Shifting seed.")
-                    if hasattr(self.train_dataset, "seed"):
-                        self.train_dataset.seed += (self.iter_num // 1000 + 1)
+            
+            # Anti-duplicate protection: If checkpoint step > 0 and no valid HF internal generator state was found,
+            # advance the dataset seed deterministically based on iteration count so it never replays document 0!
+            has_valid_hf = ds_state is not None and ds_state.get("hf_state") is not None
+            if self.iter_num > 0 and not has_valid_hf and hasattr(self.train_dataset, "seed"):
+                seed_bump = (self.iter_num // 1000 + 1)
+                self.train_dataset.seed += seed_bump
+                if self.is_master:
+                    print(f"Shifted dataset seed by +{seed_bump} (new seed: {self.train_dataset.seed}) to prevent duplicate document replay.")
 
             if getattr(self, "train_prefetcher", None) is not None:
                 self.train_prefetcher.reset()

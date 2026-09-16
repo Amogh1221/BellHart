@@ -155,11 +155,15 @@ def _train_worker(hf_token: str = "", fresh: bool = False):
     parser = argparse.ArgumentParser()
     parser.add_argument("--hf_token", type=str, default="", help="HuggingFace WRITE Token")
     parser.add_argument("--fresh", action="store_true", help="Start training fresh from Step 0, ignoring existing checkpoints")
+    parser.add_argument("--checkpoint", type=str, default="", help="Path to a specific local checkpoint to resume from (e.g. checkpoints/checkpoint-023000.pt)")
+    parser.add_argument("--no_sync", action="store_true", help="Do not download checkpoints from Hugging Face before starting")
     args, _ = parser.parse_known_args()
     if not hf_token:
         hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
     if args.fresh:
         fresh = True
+    custom_checkpoint = args.checkpoint
+    no_sync = args.no_sync or bool(custom_checkpoint)
 
     # DistributedDataParallel (DDP) detection
     is_ddp = int(os.environ.get('RANK', -1)) != -1
@@ -220,9 +224,14 @@ def _train_worker(hf_token: str = "", fresh: bool = False):
 
     repo_id = config.hf_repo
 
-    # Master downloads latest checkpoints unless --fresh is specified
-    if is_master and not fresh:
+    # Master downloads latest checkpoints unless --fresh, --no_sync, or a custom --checkpoint is specified
+    if is_master and not fresh and not no_sync:
         sync_huggingface(repo_id)
+    elif is_master and no_sync and not fresh:
+        print("\n" + "═" * 60)
+        print("  [LOCAL RUN] Skipping Hugging Face download (--no_sync / --checkpoint set).")
+        print("  Using local checkpoint files directly.")
+        print("═" * 60 + "\n")
     elif is_master and fresh:
         print("\n" + "═" * 60)
         print("  [FRESH RUN] Starting brand new training from Step 0!")
@@ -303,16 +312,13 @@ def _train_worker(hf_token: str = "", fresh: bool = False):
             config.tf32 = False
 
         # Dynamic streaming shuffle buffer:
-        # Tuned to 1,000 on high-throughput GPUs (B200/H100) to eliminate Python shuffle queue latency
-        # and prevent single-thread CPU token ingestion starvation.
-        if vram_gb >= 140:
-            stream_buffer_size = 1000
-        elif vram_gb >= 70:
-            stream_buffer_size = 1000
-        elif vram_gb >= 35:
+        # Tuned to 1,000 on high-throughput GPUs (B200/H100) to eliminate Python shuffle queue latency.
+        # On memory-constrained GPUs (T4/L4/Kaggle), keep at 500 so streaming shuffle is always active
+        # while keeping host RAM overhead strictly under 50MB.
+        if vram_gb >= 35:
             stream_buffer_size = 1000
         else:
-            stream_buffer_size = 1  # Low memory / DDP multi-shard
+            stream_buffer_size = 500
 
         if is_master:
             print(f"Auto-scaled for {vram_gb:.0f}GB VRAM → "
@@ -323,7 +329,7 @@ def _train_worker(hf_token: str = "", fresh: bool = False):
                   f"stream_buffer={stream_buffer_size}, "
                   f"dtype={config.dtype}, tf32={config.tf32}")
     else:
-        stream_buffer_size = 1
+        stream_buffer_size = 500
         config.device = "cpu"
         print("WARNING: No GPU found, falling back to CPU")
 
@@ -349,11 +355,13 @@ def _train_worker(hf_token: str = "", fresh: bool = False):
         world_size=world_size,
     )
 
-    # Initialize Trainer pipeline (non-master ranks don't need val_loader in DDP, saving host RAM on Kaggle)
-    trainer = Trainer(config, tokenizer, train_loader, val_loader if is_master else None, is_ddp=is_ddp)
-
     # Check for local checkpoints to resume (bypassed if --fresh is set)
-    if not fresh:
+    resume_path = None
+    if custom_checkpoint:
+        if not os.path.exists(custom_checkpoint):
+            raise FileNotFoundError(f"Specified checkpoint not found: {custom_checkpoint}")
+        resume_path = custom_checkpoint
+    elif not fresh:
         import glob
         checkpoints = glob.glob("checkpoints/checkpoint-*.pt")
         valid_checkpoints = [f for f in checkpoints if re.search(r"checkpoint-(\d+)\.pt", os.path.basename(f))]
@@ -362,13 +370,18 @@ def _train_worker(hf_token: str = "", fresh: bool = False):
                 valid_checkpoints,
                 key=lambda x: int(re.search(r"checkpoint-(\d+)\.pt", os.path.basename(x)).group(1))
             )[-1]
-            if is_master:
-                print(f"Resuming training from checkpoint: {resume_path}")
-            trainer.load_checkpoint(resume_path)
         elif os.path.exists("checkpoints/latest.pt"):
-            if is_master:
-                print("Resuming training from checkpoint: checkpoints/latest.pt")
-            trainer.load_checkpoint("checkpoints/latest.pt")
+            resume_path = "checkpoints/latest.pt"
+
+    # Initialize Trainer pipeline (loads checkpoint BEFORE starting background prefetching threads)
+    trainer = Trainer(
+        config,
+        tokenizer,
+        train_loader,
+        val_loader if is_master else None,
+        is_ddp=is_ddp,
+        resume_path=resume_path,
+    )
 
     # Reclaim host RAM before launching training loop
     import gc

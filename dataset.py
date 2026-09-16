@@ -41,12 +41,13 @@ class HFStreamingDataset(IterableDataset):
         split: str,
         tokenizer,
         block_size: int,
-        buffer_size: int = 10,
+        buffer_size: int = 1000,
         seed: int = 42,
         config_name: Optional[str] = None,
         rank: int = 0,
         world_size: int = 1,
         load_dataset_fn: Optional[Any] = None,
+        skip_initial_examples: int = 0,
     ):
         super().__init__()
         self.dataset_name = dataset_name
@@ -54,11 +55,13 @@ class HFStreamingDataset(IterableDataset):
         self.split = split
         self.tokenizer = tokenizer
         self.block_size = block_size
-        self.buffer_size = buffer_size
+        # Always enforce a healthy shuffle buffer for training to prevent sequential duplicate reads
+        self.buffer_size = max(buffer_size, 500) if split == "train" else buffer_size
         self.seed = seed
         self.rank = rank
         self.world_size = world_size
         self.load_dataset_fn = load_dataset_fn
+        self.skip_initial_examples = skip_initial_examples
 
         # Internal stream tracking state
         self.epoch = 0
@@ -112,10 +115,11 @@ class HFStreamingDataset(IterableDataset):
         """
         Main streaming generator loop:
           1. Connects to HuggingFace dataset stream.
-          2. Shards stream across DDP ranks.
-          3. Shuffles stream with buffer (if buffer_size > 1).
-          4. Restores HF checkpoint state if resuming.
-          5. Reads documents, encodes tokens, and yields (block_size + 1) chunks.
+          2. Applies initial document skip if requested (e.g. for validation isolation).
+          3. Shards stream across DDP ranks.
+          4. Shuffles stream with buffer to ensure non-duplicate pseudo-random order.
+          5. Restores HF checkpoint state if resuming, with seed-shifting fallback.
+          6. Reads documents, encodes tokens, and yields (block_size + 1) chunks.
         """
         worker_info = torch.utils.data.get_worker_info()
         seed = self.seed
@@ -137,24 +141,41 @@ class HFStreamingDataset(IterableDataset):
                 else:
                     ds = load_fn(self.dataset_name, split=self.split, streaming=True)
 
-                # 2. Shard across GPU ranks so each worker gets an independent stream partition
+                # 2. Skip initial examples if configured (decouples validation from train)
+                if self.skip_initial_examples > 0:
+                    ds = ds.skip(self.skip_initial_examples)
+
+                # 3. Shard across GPU ranks so each worker gets an independent stream partition
                 if self.world_size > 1:
                     ds = ds.shard(num_shards=self.world_size, index=self.rank)
 
-                # 3. Shuffle stream only if buffer_size > 1 (sharding across 1000 files provides natural shuffling)
-                if self.buffer_size > 1:
-                    ds = ds.shuffle(buffer_size=self.buffer_size, seed=seed)
-
-                # 4. Restore exact checkpoint stream state if resuming
+                # 4. Checkpoint state restoration with anti-duplication protection
+                restored_hf = False
                 if state_to_restore is not None and state_to_restore.get("hf_state") is not None:
                     try:
                         ds.load_state_dict(state_to_restore["hf_state"])
                         if "token_buffer" in state_to_restore:
                             self.token_buffer = deque(state_to_restore["token_buffer"])
+                        restored_hf = True
+                        log.info("Successfully restored HuggingFace streaming dataset generator state.")
                     except Exception as e:
-                        log.warning(f"Could not restore HF dataset state directly ({e}). Stream will continue with seed {seed}.")
-                    state_to_restore = None
+                        log.warning(f"Could not restore HF dataset state directly ({e}). Stream will continue with shifted seed.")
 
+                # If HF internal generator state could not be restored, advance seed deterministically
+                # based on chunks already yielded so we do NOT replay the same document sequence!
+                if state_to_restore is not None and not restored_hf:
+                    chunks_done = state_to_restore.get("chunks_yielded", self.chunks_yielded)
+                    if chunks_done > 0:
+                        seed_shift = (chunks_done // 1000) + 1
+                        seed = self.seed + seed_shift
+                        self.seed = seed
+                        log.info(f"Advanced stream shuffle seed to {seed} (+{seed_shift}) to prevent duplicate data training.")
+
+                # 5. Shuffle stream with buffer
+                if self.buffer_size > 1:
+                    ds = ds.shuffle(buffer_size=self.buffer_size, seed=seed)
+
+                state_to_restore = None
                 self.raw_dataset = ds
                 self.dataset_iter = iter(ds)
 
@@ -207,13 +228,13 @@ def create_streaming_dataloaders(
     dataset_config: Optional[str] = None,
     rank: int = 0,
     world_size: int = 1,
-    buffer_size: int = 1,
+    buffer_size: int = 1000,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Builds training and validation DataLoaders using streaming iterables.
     
-    The validation stream uses an isolated seed offset (+100,000) to ensure
-    evaluation samples remain strictly out-of-distribution from the training stream.
+    The validation stream skips 500,000 documents to guarantee evaluation samples
+    remain completely disjoint and out-of-distribution from the training stream prefix.
     """
     train_dataset = HFStreamingDataset(
         dataset_name=dataset_name,
@@ -237,6 +258,7 @@ def create_streaming_dataloaders(
         config_name=dataset_config,
         rank=0,
         world_size=1,
+        skip_initial_examples=500_000,  # Decouple validation set completely from training stream
     )
 
     train_loader = DataLoader(
