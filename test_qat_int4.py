@@ -75,8 +75,13 @@ def test_model_qat_conversion():
     apply_qat_to_modernbert(model, group_size=64)
 
     qat_layers = [m for m in model.modules() if isinstance(m, FakeQuantLinearW4A16)]
-    assert len(qat_layers) == len(orig_linears), (
-        f"Expected {len(orig_linears)} QAT layers, found {len(qat_layers)}"
+    # All internal transformer projections (14 layers for 2 blocks) are quantized, while lm_head stays in FP16
+    expected_qat = len(orig_linears) - 1
+    assert len(qat_layers) == expected_qat, (
+        f"Expected {expected_qat} QAT layers, found {len(qat_layers)}"
+    )
+    assert isinstance(model.lm_head, nn.Linear) and not isinstance(model.lm_head, FakeQuantLinearW4A16), (
+        "lm_head should be preserved as high-precision nn.Linear!"
     )
 
     # Test forward pass through QAT model

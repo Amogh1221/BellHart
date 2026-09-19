@@ -207,15 +207,17 @@ def unpack_weights_int4(
 # 4. Model-Wide QAT Insertion for ModernBert
 # ──────────────────────────────────────────────────────────────────────────────
 
-def apply_qat_to_modernbert(model: nn.Module, group_size: int = 64) -> nn.Module:
+def apply_qat_to_modernbert(model: nn.Module, group_size: int = 64, skip_modules: tuple = ("lm_head", "head", "classifier")) -> nn.Module:
     """
     Traverses ModernBertModel and replaces all compute-intensive linear projection layers
     with FakeQuantLinearW4A16:
       - Attention: Wq, Wk, Wv, Wo
       - SwiGLU MLP: w1, w2, w3
-    Leaves RoPE frequencies, RMSNorm, and Softmax in high precision.
+    Leaves sensitive heads (lm_head, classifier), RoPE, RMSNorm, and Embeddings in FP16.
     """
     for name, module in model.named_children():
+        if name in skip_modules:
+            continue
         if isinstance(module, nn.Linear):
             # Only quantize if in_features is divisible by group_size (768 and 2048 both match)
             if module.in_features % group_size == 0:
@@ -223,7 +225,7 @@ def apply_qat_to_modernbert(model: nn.Module, group_size: int = 64) -> nn.Module
                 setattr(model, name, qat_layer)
         else:
             # Recursive descent into TransformerBlock, ModernAttention, ModernMLP
-            apply_qat_to_modernbert(module, group_size=group_size)
+            apply_qat_to_modernbert(module, group_size=group_size, skip_modules=skip_modules)
     return model
 
 

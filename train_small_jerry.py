@@ -138,14 +138,15 @@ def train_small_jerry(
     dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=0, pin_memory=True)
     data_iter = iter(dataloader)
 
-    # 5. Optimizer for QAT fine-tuning (gentle learning rate)
+    # 5. Optimizer and Cosine Decay Scheduler for QAT cooldown
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=(config.dtype == "float16" and device.type == "cuda"))
     dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float16
 
     # 6. QAT Cooldown Loop
     model.train()
-    print(f"\nCommencing {steps:,} QAT adaptation steps (Learning Rate: {learning_rate:.1e})...")
+    print(f"\nCommencing {steps:,} QAT adaptation steps (Initial LR: {learning_rate:.1e} -> 1.0e-6)...")
     pbar = tqdm(range(1, steps + 1), desc="SmallJerry QAT", dynamic_ncols=True)
 
     accum_steps = 4
@@ -180,8 +181,11 @@ def train_small_jerry(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
+        scheduler.step()
+
         running_loss = 0.95 * running_loss + 0.05 * step_loss if running_loss > 0 else step_loss
-        pbar.set_postfix({"mlm_loss": f"{running_loss:.4f}", "ppl": f"{math.exp(min(running_loss, 20.0)):.2f}"})
+        cur_lr = scheduler.get_last_lr()[0]
+        pbar.set_postfix({"mlm_loss": f"{running_loss:.4f}", "ppl": f"{math.exp(min(running_loss, 20.0)):.2f}", "lr": f"{cur_lr:.1e}"})
 
     pbar.close()
     elapsed = time.time() - t0
