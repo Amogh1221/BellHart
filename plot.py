@@ -87,24 +87,30 @@ def apply_dark_theme():
 def parse_log_file(filepath: str) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     """
     Parses both step-by-step progress lines and multi-line evaluation blocks.
-    Automatically handles restarts by deduplicating earlier overlapping steps.
+    Robustly handles:
+      - Single or duplicate timestamps (e.g. [2026-09-09 ...] [2026-09-09 ...] STEP ...)
+      - Optional step perplexity (e.g. ppl=11.24 in BERT logs)
+      - Both standard 'EVALUATION' and 'BERT EVALUATION' blocks
+      - Resets/restarts by deduplicating earlier overlapping steps (latest wins)
     """
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Log file not found: {filepath}")
 
-    # Regex for step lines:
+    # Regex for step lines supporting standard LLM and BERT logs:
     # [2026-08-28 03:59:53] STEP       1/150000 | Tokens: 163,840 | loss=23.4341 | lr=3.33e-07 | grad_norm=2.301 | tok/s=583
+    # [2026-09-09 14:39:48] [2026-09-09 14:39:48] STEP   5650/150000 | Tokens: 370,278,400 | loss=2.4191 | ppl=11.24 | lr=6.00e-04 | grad_norm=0.386 | tok/s=19,860 | ETA: 5d 5h 52m
     step_pattern = re.compile(
-        r"\[(?P<time>[\d\- :]+)\]\s+STEP\s+(?P<step>\d+)/(?P<total>\d+)\s+\|\s+"
+        r"(?:\[(?P<time>[\d\- :]+)\]\s*)+\s*STEP\s+(?P<step>\d+)/(?P<total>\d+)\s+\|\s+"
         r"Tokens:\s+(?P<tokens>[\d,]+)\s+\|\s+"
         r"loss=(?P<loss>[\d\.]+)\s+\|\s+"
+        r"(?:ppl=(?P<ppl>[\d\.]+)\s+\|\s+)?"
         r"lr=(?P<lr>[\d\.eE\+\-]+)\s+\|\s+"
         r"grad_norm=(?P<grad_norm>[\d\.]+)\s+\|\s+"
         r"tok/s=(?P<tok_sec>[\d,]+)"
     )
 
-    # Regex patterns for evaluation blocks:
-    eval_header = re.compile(r"EVALUATION @ Step (?P<step>\d+)\s+/\s+(?P<total>\d+)")
+    # Regex patterns for evaluation blocks (supports both BellHart and BERT):
+    eval_header = re.compile(r"(?:BERT\s+)?EVALUATION\s+@\s+Step\s+(?P<step>\d+)\s+/\s+(?P<total>\d+)")
     eval_tokens = re.compile(r"Tokens Processed\s+:\s+(?P<tokens>[\d,]+)")
     eval_train_loss = re.compile(r"Train Loss\s+:\s+(?P<loss>[\d\.]+)")
     eval_val_loss = re.compile(r"Val Loss\s+:\s+(?P<loss>[\d\.]+)")
@@ -121,6 +127,8 @@ def parse_log_file(filepath: str) -> Tuple[Dict[str, np.ndarray], Dict[str, np.n
         step = int(match.group("step"))
         tokens = int(match.group("tokens").replace(",", ""))
         loss = float(match.group("loss"))
+        ppl_str = match.group("ppl")
+        ppl = float(ppl_str) if ppl_str is not None else np.nan
         lr = float(match.group("lr"))
         grad_norm = float(match.group("grad_norm"))
         tok_sec = float(match.group("tok_sec").replace(",", ""))
@@ -130,6 +138,7 @@ def parse_log_file(filepath: str) -> Tuple[Dict[str, np.ndarray], Dict[str, np.n
             "step": step,
             "tokens": tokens,
             "loss": loss,
+            "ppl": ppl,
             "lr": lr,
             "grad_norm": grad_norm,
             "tok_sec": tok_sec,
@@ -146,7 +155,7 @@ def parse_log_file(filepath: str) -> Tuple[Dict[str, np.ndarray], Dict[str, np.n
             step = int(match.group("step"))
             entry = {"step": step}
             # Scan following lines within evaluation block
-            for j in range(i + 1, min(i + 20, len(lines))):
+            for j in range(i + 1, min(i + 22, len(lines))):
                 sub = lines[j]
                 if "Tokens Processed" in sub:
                     t_match = eval_tokens.search(sub)
@@ -178,6 +187,7 @@ def parse_log_file(filepath: str) -> Tuple[Dict[str, np.ndarray], Dict[str, np.n
         "step": np.array([step_data[s]["step"] for s in sorted_steps]),
         "tokens": np.array([step_data[s]["tokens"] for s in sorted_steps]),
         "loss": np.array([step_data[s]["loss"] for s in sorted_steps]),
+        "ppl": np.array([step_data[s]["ppl"] for s in sorted_steps]),
         "lr": np.array([step_data[s]["lr"] for s in sorted_steps]),
         "grad_norm": np.array([step_data[s]["grad_norm"] for s in sorted_steps]),
         "tok_sec": np.array([step_data[s]["tok_sec"] for s in sorted_steps]),
@@ -216,8 +226,9 @@ def create_dashboard(
     output_path: str = "training_plots.png",
     smooth_window: int = 25,
     show: bool = False,
+    is_bert: bool = False,
 ):
-    """Renders the 6-panel BellHart training dashboard and saves high-res image."""
+    """Renders the 6-panel training dashboard and saves high-res image."""
     apply_dark_theme()
 
     fig = plt.figure(figsize=(18, 12), dpi=150)
@@ -230,23 +241,31 @@ def create_dashboard(
     best_val = np.min(evals["val_loss"]) if len(evals["val_loss"]) > 0 else np.nan
     best_ppl = np.min(evals["ppl"]) if len(evals["ppl"]) > 0 else np.nan
 
+    if total_tokens >= 1e9:
+        tok_label = f"{total_tokens / 1e9:.2f}B"
+    else:
+        tok_label = f"{total_tokens / 1e6:,.1f}M"
+
+    model_title = "Modern BERT (Encoder)" if is_bert else "BellHart (LLM)"
+    loss_label = "Masked LM Loss" if is_bert else "Cross Entropy Loss"
+
     # Figure Header
     fig.suptitle(
-        f"BellHart Pre-Training Metrics  •  Step {current_step:,}  •  {total_tokens / 1e6:,.1f}M Tokens  •  "
+        f"{model_title} Pre-Training Metrics  •  Step {current_step:,}  •  {tok_label} Tokens  •  "
         f"Min Train Loss: {best_loss:.4f}  •  Best Val PPL: {best_ppl:.2f}",
         fontsize=15,
         fontweight="bold",
         color=THEME["title"],
     )
 
-    # ── Panel 1: Cross-Entropy Loss Curve ────────────────────────────────────
+    # ── Panel 1: Loss Curve ──────────────────────────────────────────────────
     ax1 = fig.add_subplot(gs[0, 0])
     smoothed_loss = moving_average(steps["loss"], window_size=smooth_window)
     ax1.plot(step_nums, steps["loss"], color=THEME["accent_blue"], alpha=0.25, label="Step Loss (Raw)", lw=1.0)
     ax1.plot(step_nums, smoothed_loss, color=THEME["accent_blue"], lw=2.0, label=f"Train Loss (MA-{smooth_window})")
 
     if len(evals["val_loss"]) > 0:
-        ax1.plot(evals["step"], evals["val_loss"], color=THEME["accent_orange"], marker="o", lw=2.0, ms=6, label="Val Loss (Eval)")
+        ax1.plot(evals["step"], evals["val_loss"], color=THEME["accent_orange"], marker="o", lw=2.0, ms=5, label="Val Loss (Eval)")
         best_idx = np.argmin(evals["val_loss"])
         ax1.scatter(
             [evals["step"][best_idx]],
@@ -258,29 +277,43 @@ def create_dashboard(
             label=f"Best Val: {evals['val_loss'][best_idx]:.4f}",
         )
 
-    ax1.set_title("Training & Validation Loss", fontweight="bold")
+    ax1.set_title(f"Training & Validation Loss ({loss_label})", fontweight="bold")
     ax1.set_xlabel("Optimizer Steps")
-    ax1.set_ylabel("Cross Entropy Loss")
+    ax1.set_ylabel(loss_label)
     ax1.legend(loc="upper right")
     ax1.xaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.0f}"))
 
     # ── Panel 2: Validation Perplexity (PPL) ─────────────────────────────────
     ax2 = fig.add_subplot(gs[0, 1])
+    has_step_ppl = not np.all(np.isnan(steps["ppl"]))
+
+    if has_step_ppl:
+        smoothed_step_ppl = moving_average(steps["ppl"], window_size=smooth_window)
+        ax2.plot(step_nums, steps["ppl"], color=THEME["accent_pink"], alpha=0.20, lw=1.0, label="Step PPL (Raw)")
+        ax2.plot(step_nums, smoothed_step_ppl, color=THEME["accent_pink"], lw=1.5, label=f"Step PPL (MA-{smooth_window})")
+
     if len(evals["ppl"]) > 0:
-        ax2.plot(evals["step"], evals["ppl"], color=THEME["accent_pink"], marker="s", lw=2.0, ms=6, label="Validation PPL")
-        ax2.set_title("Validation Perplexity (Log Scale)", fontweight="bold")
-        ax2.set_yscale("log")
-        ax2.yaxis.set_major_formatter(ticker.ScalarFormatter())
-        ax2.set_xlabel("Optimizer Steps")
-        ax2.set_ylabel("Perplexity (exp(Loss))")
-        ax2.legend(loc="upper right")
-    else:
-        # Fallback to token-level loss if no evals available yet
-        ax2.plot(step_nums, np.exp(np.clip(smoothed_loss, 0, 10)), color=THEME["accent_pink"], lw=1.8)
-        ax2.set_title("Estimated Training Perplexity", fontweight="bold")
-        ax2.set_yscale("log")
-        ax2.set_xlabel("Optimizer Steps")
-        ax2.set_ylabel("Perplexity")
+        ax2.plot(evals["step"], evals["ppl"], color=THEME["accent_gold"], marker="s", lw=2.0, ms=5, label="Validation PPL")
+        best_ppl_idx = np.argmin(evals["ppl"])
+        ax2.scatter(
+            [evals["step"][best_ppl_idx]],
+            [evals["ppl"][best_ppl_idx]],
+            color=THEME["accent_green"],
+            s=100,
+            zorder=6,
+            edgecolors=THEME["bg"],
+            label=f"Min Val PPL: {evals['ppl'][best_ppl_idx]:.2f}",
+        )
+    elif not has_step_ppl:
+        # Fallback to estimated perplexity from loss
+        ax2.plot(step_nums, np.exp(np.clip(smoothed_loss, 0, 10)), color=THEME["accent_pink"], lw=1.8, label="Estimated PPL")
+
+    ax2.set_title("Perplexity Dynamics", fontweight="bold")
+    ax2.set_yscale("log")
+    ax2.yaxis.set_major_formatter(ticker.ScalarFormatter())
+    ax2.set_xlabel("Optimizer Steps")
+    ax2.set_ylabel("Perplexity")
+    ax2.legend(loc="upper right")
     ax2.xaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.0f}"))
 
     # ── Panel 3: Learning Rate Schedule ──────────────────────────────────────
@@ -302,21 +335,21 @@ def create_dashboard(
     ax4.set_title("Gradient Norm Stability", fontweight="bold")
     ax4.set_xlabel("Optimizer Steps")
     ax4.set_ylabel("L2 Norm")
-    ax4.set_ylim(0, max(2.5, min(np.percentile(steps["grad_norm"], 99) * 1.3, 15.0)))
+    y_max = max(1.5, min(float(np.percentile(steps["grad_norm"], 99.5)) * 1.3, 10.0))
+    ax4.set_ylim(0, y_max)
     ax4.xaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.0f}"))
     ax4.legend(loc="upper right")
 
     # ── Panel 5: Training Throughput (Tokens / Sec) ───────────────────────────
     ax5 = fig.add_subplot(gs[2, 0])
-    # Filter out evaluation step spikes for clean rolling average
     valid_mask = steps["tok_sec"] > 500
-    clean_steps = step_nums[valid_mask]
-    clean_tok_sec = steps["tok_sec"][valid_mask]
+    clean_steps = step_nums[valid_mask] if np.any(valid_mask) else step_nums
+    clean_tok_sec = steps["tok_sec"][valid_mask] if np.any(valid_mask) else steps["tok_sec"]
     smoothed_tps = moving_average(clean_tok_sec, window_size=max(10, smooth_window // 2))
 
     ax5.plot(step_nums, steps["tok_sec"], color=THEME["accent_green"], alpha=0.2, lw=1.0, label="Raw tok/s")
     ax5.plot(clean_steps, smoothed_tps, color=THEME["accent_green"], lw=2.0, label="Steady-State tok/s")
-    avg_tps = np.mean(clean_tok_sec)
+    avg_tps = float(np.mean(clean_tok_sec))
     ax5.axhline(avg_tps, color=THEME["accent_gold"], linestyle="--", alpha=0.8, label=f"Mean: {avg_tps:,.0f} tok/s")
 
     ax5.set_title("Training Throughput", fontweight="bold")
@@ -328,13 +361,21 @@ def create_dashboard(
 
     # ── Panel 6: Cumulative Tokens Processed ─────────────────────────────────
     ax6 = fig.add_subplot(gs[2, 1])
-    tokens_millions = steps["tokens"] / 1e6
-    ax6.fill_between(step_nums, tokens_millions, color=THEME["accent_blue"], alpha=0.15)
-    ax6.plot(step_nums, tokens_millions, color=THEME["accent_blue"], lw=2.0, label="Cumulative Tokens")
-    ax6.set_title("Cumulative Token Volume", fontweight="bold")
+    if total_tokens >= 1e9:
+        tokens_scaled = steps["tokens"] / 1e9
+        unit = "Billions"
+        fmt = "{x:,.2f}B"
+    else:
+        tokens_scaled = steps["tokens"] / 1e6
+        unit = "Millions"
+        fmt = "{x:,.0f}M"
+
+    ax6.fill_between(step_nums, tokens_scaled, color=THEME["accent_blue"], alpha=0.15)
+    ax6.plot(step_nums, tokens_scaled, color=THEME["accent_blue"], lw=2.0, label="Cumulative Tokens")
+    ax6.set_title(f"Cumulative Token Volume ({unit})", fontweight="bold")
     ax6.set_xlabel("Optimizer Steps")
-    ax6.set_ylabel("Tokens (Millions)")
-    ax6.yaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.0f}M"))
+    ax6.set_ylabel(f"Tokens ({unit})")
+    ax6.yaxis.set_major_formatter(ticker.StrMethodFormatter(fmt))
     ax6.xaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.0f}"))
     ax6.legend(loc="upper left")
 
@@ -352,23 +393,32 @@ def create_dashboard(
 # Summary Report Printer
 # ──────────────────────────────────────────────────────────────────────────────
 
-def print_summary_report(steps: Dict[str, np.ndarray], evals: Dict[str, np.ndarray]):
+def print_summary_report(steps: Dict[str, np.ndarray], evals: Dict[str, np.ndarray], is_bert: bool = False):
     """Prints a structured terminal summary of training progression."""
     current_step = steps["step"][-1]
+    first_step = steps["step"][0]
     total_tokens = steps["tokens"][-1]
     initial_loss = steps["loss"][0]
     current_loss = steps["loss"][-1]
     min_loss = np.min(steps["loss"])
-    mean_tok_sec = np.mean(steps["tok_sec"][steps["tok_sec"] > 500])
+    valid_tps = steps["tok_sec"][steps["tok_sec"] > 500]
+    mean_tok_sec = np.mean(valid_tps) if len(valid_tps) > 0 else np.mean(steps["tok_sec"])
+
+    if total_tokens >= 1e9:
+        tok_str = f"{total_tokens:,} ({total_tokens / 1e9:.2f} Billion)"
+    else:
+        tok_str = f"{total_tokens:,} ({total_tokens / 1e6:.2f} Million)"
+
+    title = "MODERN BERT PRE-TRAINING SUMMARY & METRICS" if is_bert else "BELLHART TRAINING SUMMARY & METRICS"
 
     hr = "=" * 64
     print(f"\n{hr}")
-    print("  BELLHART TRAINING SUMMARY & METRICS")
+    print(f"  {title}")
     print(f"{hr}")
-    print(f"  Current Step       : {current_step:,}")
-    print(f"  Total Tokens       : {total_tokens:,} ({total_tokens / 1e6:.2f} Million)")
-    print(f"  Initial Loss       : {initial_loss:.4f}")
-    print(f"  Current Loss       : {current_loss:.4f}")
+    print(f"  Step Range         : Step {first_step:,} -> Step {current_step:,} ({len(steps['step']):,} logs)")
+    print(f"  Total Tokens       : {tok_str}")
+    print(f"  Initial Loss       : {initial_loss:.4f} (at Step {first_step:,})")
+    print(f"  Current Loss       : {current_loss:.4f} (at Step {current_step:,})")
     print(f"  Lowest Train Loss  : {min_loss:.4f}")
     print(f"  Current Learning Rt: {steps['lr'][-1]:.2e}")
     print(f"  Mean Throughput    : {mean_tok_sec:,.0f} tokens/second")
@@ -388,18 +438,23 @@ def print_summary_report(steps: Dict[str, np.ndarray], evals: Dict[str, np.ndarr
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="BellHart Training Log Visualizer & Metric Dashboard")
+    parser = argparse.ArgumentParser(description="BellHart / Modern BERT Training Log Visualizer & Metric Dashboard")
     parser.add_argument(
         "--log_file",
         type=str,
-        default="logs.txt",
-        help="Path to training log file (default: logs.txt, fallback: logs/training_log.txt)",
+        default="",
+        help="Path to training log file (default: logs.txt or bert_logs.txt when --bert is active)",
+    )
+    parser.add_argument(
+        "--bert",
+        action="store_true",
+        help="Plot BERT pre-training logs (defaults to bert_logs.txt and bert_training_plots.png)",
     )
     parser.add_argument(
         "--out",
         type=str,
-        default="training_plots.png",
-        help="Output filepath for the rendered dashboard image (default: training_plots.png)",
+        default="",
+        help="Output filepath for the rendered dashboard image (default: training_plots.png or bert_training_plots.png)",
     )
     parser.add_argument(
         "--smooth",
@@ -414,19 +469,52 @@ def main():
     )
     args = parser.parse_args()
 
-    # Determine log file path
+    # Determine whether plotting BERT or LLM
+    is_bert = args.bert or ("bert" in (args.log_file or "").lower())
+
+    # Set default log file path
     target_log = args.log_file
+    if not target_log:
+        if is_bert:
+            if os.path.exists("bert_logs.txt"):
+                target_log = "bert_logs.txt"
+            elif os.path.exists("bert_logs/bert_training_log.txt"):
+                target_log = "bert_logs/bert_training_log.txt"
+            else:
+                target_log = "bert_logs.txt"
+        else:
+            if os.path.exists("logs.txt"):
+                target_log = "logs.txt"
+            elif os.path.exists("logs/training_log.txt"):
+                target_log = "logs/training_log.txt"
+            else:
+                target_log = "logs.txt"
+
     if not os.path.exists(target_log):
-        if os.path.exists("logs/training_log.txt"):
-            target_log = "logs/training_log.txt"
+        # Fallback check for alternate location
+        alt = "bert_logs/bert_training_log.txt" if is_bert else "logs/training_log.txt"
+        if os.path.exists(alt):
+            target_log = alt
         else:
             print(f"Error: Log file '{target_log}' not found.")
             return
 
-    print(f"Parsing training logs from: {target_log} ...")
+    # Set default output image path
+    output_path = args.out
+    if not output_path:
+        output_path = "bert_training_plots.png" if is_bert else "training_plots.png"
+
+    print(f"Parsing {'BERT' if is_bert else 'LLM'} training logs from: {target_log} ...")
     steps, evals = parse_log_file(target_log)
-    print_summary_report(steps, evals)
-    create_dashboard(steps, evals, output_path=args.out, smooth_window=args.smooth, show=args.show)
+    print_summary_report(steps, evals, is_bert=is_bert)
+    create_dashboard(
+        steps,
+        evals,
+        output_path=output_path,
+        smooth_window=args.smooth,
+        show=args.show,
+        is_bert=is_bert,
+    )
 
 
 if __name__ == "__main__":
