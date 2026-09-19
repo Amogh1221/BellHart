@@ -80,12 +80,11 @@ class GeneralJerryClassifier(nn.Module):
         if attention_mask is None:
             attention_mask = (input_ids != 0).long()
 
-        # Extract contextual token representations from encoder
-        _, hidden_states = self.encoder(input_ids, output_hidden_states=True)
-        last_hidden = hidden_states[-1]
+        # Extract contextual token representations from encoder (shape: [B, T, D])
+        _, hidden_states = self.encoder(input_ids, attention_mask=attention_mask, output_hidden_states=True)
 
-        # Mean pool across sequence
-        pooled = self.mean_pooling(last_hidden, attention_mask)
+        # Mean pool across sequence [B, T, D] -> [B, D]
+        pooled = self.mean_pooling(hidden_states, attention_mask)
         pooled = self.dropout(pooled)
         logits = self.classifier(pooled)
         return logits

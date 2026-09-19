@@ -290,9 +290,14 @@ class ModernBertModel(nn.Module):
 
         x = self.drop(self.wte(input_ids) * math.sqrt(self.config.n_embd))
 
+        if attention_mask is not None and attention_mask.dim() == 2:
+            sdpa_mask = (attention_mask != 0)[:, None, None, :]
+        else:
+            sdpa_mask = attention_mask
+
         v_prev = None
         for layer in self.layers:
-            x, v_cur = layer(x, rope_cos, rope_sin, v_prev=v_prev, attention_mask=attention_mask)
+            x, v_cur = layer(x, rope_cos, rope_sin, v_prev=v_prev, attention_mask=sdpa_mask)
             v_prev = v_cur
 
         hidden_states = self.ln_f(x)
