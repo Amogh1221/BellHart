@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from huggingface_hub import HfApi
 
@@ -176,22 +177,40 @@ def pack_general_jerry(model: GeneralJerryClassifier, group_size: int = 64) -> d
 
 def train_general_jerry(
     base_checkpoint: str = "bert_checkpoints/latest_bert.pt",
-    epochs: int = 2,
+    epochs: int = 3,
     batch_size: int = 32,
     learning_rate: float = 3e-5,
     group_size: int = 64,
-    max_samples: int = 100000,
+    max_samples: int = 0,
     output_dir: str = "exported_models/GeneralJerry",
     hf_repo: str = "Amogh1221/Jerry",
     upload: bool = False,
     hf_token: str = "",
 ):
-    print(f"\n{'='*65}")
-    print("  TRAINING GENERAL PURPOSE JERRY: INT4 (W4A16) QAT NLU ENGINE")
-    print(f"{'='*65}\n")
+    # 0. Distributed Data Parallel (DDP) Detection
+    is_ddp = int(os.environ.get("RANK", -1)) != -1
+    if is_ddp:
+        import torch.distributed as dist
+        dist.init_process_group(backend="nccl")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        is_master = (rank == 0)
+    else:
+        rank = 0
+        local_rank = 0
+        world_size = 1
+        is_master = True
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(output_dir, exist_ok=True)
+    if is_master:
+        print(f"\n{'='*65}")
+        print("  TRAINING GENERAL PURPOSE JERRY: INT4 (W4A16) QAT NLU ENGINE")
+        print(f"{'='*65}\n")
+        print(f"Device: {device} | DDP: {is_ddp} (World Size: {world_size})\n")
+        os.makedirs(output_dir, exist_ok=True)
 
     # 1. Tokenizer & Base Config
     tokenizer = Tokenizer()
@@ -204,7 +223,8 @@ def train_general_jerry(
         if candidates:
             base_checkpoint = str(candidates[-1])
         else:
-            print(f"Checkpoint '{base_checkpoint}' not found locally. Checking Hugging Face (Amogh1221/bellhart_training)...")
+            if is_master:
+                print(f"Checkpoint '{base_checkpoint}' not found locally. Checking Hugging Face (Amogh1221/bellhart_training)...")
             try:
                 from huggingface_hub import hf_hub_download
                 token = hf_token or os.environ.get("HF_TOKEN", "")
@@ -216,30 +236,44 @@ def train_general_jerry(
                     local_dir=".",
                 )
                 base_checkpoint = downloaded
-                print(f"  [OK] Successfully downloaded latest checkpoint -> {base_checkpoint}")
+                if is_master:
+                    print(f"  [OK] Successfully downloaded latest checkpoint -> {base_checkpoint}")
             except Exception as e:
                 raise FileNotFoundError(f"Base checkpoint not found at: {base_checkpoint} ({e})")
 
-    print(f"Loading pre-trained ModernBERT weights from: {base_checkpoint} ...")
+    if is_ddp:
+        import torch.distributed as dist
+        dist.barrier()
+
+    if is_master:
+        print(f"Loading pre-trained ModernBERT weights from: {base_checkpoint} ...")
     ckpt = torch.load(base_checkpoint, map_location="cpu", weights_only=False)
 
     model = GeneralJerryClassifier(config, num_classes=3)
     model.encoder.load_state_dict(ckpt["model_state_dict"], strict=True)
-    print("  [OK] Pre-trained weights loaded into encoder backbone.")
+    if is_master:
+        print("  [OK] Pre-trained weights loaded into encoder backbone.")
 
     # 3. Apply INT4 W4A16 QAT
-    print(f"Applying INT4 W4A16 Group-Wise QAT (group_size={group_size})...")
+    if is_master:
+        print(f"Applying INT4 W4A16 Group-Wise QAT (group_size={group_size})...")
     apply_qat_to_modernbert(model.encoder, group_size=group_size)
     model = model.to(device)
-    print("  [OK] Encoder projections converted to FakeQuantLinearW4A16.")
+    if is_master:
+        print("  [OK] Encoder projections converted to FakeQuantLinearW4A16.")
+
+    if is_ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(model, device_ids=[local_rank])
 
     # 4. Load MNLI Dataset from Hugging Face
-    print("\nLoading MNLI dataset from Hugging Face (GLUE/MNLI)...")
+    if is_master:
+        print("\nLoading MNLI dataset from Hugging Face (GLUE/MNLI)...")
     from datasets import load_dataset
     hf_raw = load_dataset("glue", "mnli")
 
     train_raw = hf_raw["train"]
-    if max_samples and max_samples < len(train_raw):
+    if max_samples and max_samples > 0 and max_samples < len(train_raw):
         train_raw = train_raw.select(range(max_samples))
 
     val_raw = hf_raw["validation_matched"].select(range(min(3000, len(hf_raw["validation_matched"]))))
@@ -247,21 +281,35 @@ def train_general_jerry(
     train_ds = MNLIDataset(train_raw, tokenizer, max_len=192)
     val_ds = MNLIDataset(val_raw, tokenizer, max_len=192)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_mnli, num_workers=0)
+    sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=(sampler is None),
+        sampler=sampler,
+        collate_fn=collate_mnli,
+        num_workers=2 if is_ddp else 0,
+        pin_memory=True,
+    )
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_mnli, num_workers=0)
 
     # 5. Optimizer & Scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
     total_steps = len(train_loader) * epochs
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=(config.dtype == "float16" and device.type == "cuda"))
     dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float16
 
-    print(f"\nCommencing {epochs} epochs of INT4 QAT fine-tuning ({total_steps:,} total optimizer steps)...")
+    if is_master:
+        print(f"\nCommencing {epochs} epochs of INT4 QAT fine-tuning ({total_steps:,} total optimizer steps on {world_size} GPUs)...")
     best_acc = 0.0
 
     for epoch in range(1, epochs + 1):
+        if is_ddp and sampler is not None:
+            sampler.set_epoch(epoch)
+
         model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} (QAT)", dynamic_ncols=True)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} (QAT)", dynamic_ncols=True) if is_master else train_loader
         total_loss = 0.0
 
         for input_ids, attention_mask, labels in pbar:
@@ -286,50 +334,57 @@ def train_general_jerry(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
+            scheduler.step()
+
             total_loss += loss.item()
-            pbar.set_postfix({"train_loss": f"{loss.item():.4f}"})
+            if is_master:
+                cur_lr = scheduler.get_last_lr()[0]
+                pbar.set_postfix({"train_loss": f"{loss.item():.4f}", "lr": f"{cur_lr:.1e}"})
 
-        # Evaluation on Validation Matched
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for input_ids, attention_mask, labels in val_loader:
-                input_ids = input_ids.to(device, non_blocking=True)
-                attention_mask = attention_mask.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
+        # Evaluation on Validation Matched (rank 0 evaluates)
+        if is_master:
+            model.eval()
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for input_ids, attention_mask, labels in val_loader:
+                    input_ids = input_ids.to(device, non_blocking=True)
+                    attention_mask = attention_mask.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True)
 
-                with torch.amp.autocast("cuda", dtype=dtype, enabled=(device.type == "cuda")):
-                    logits = model(input_ids, attention_mask)
-                    preds = torch.argmax(logits, dim=-1)
+                    with torch.amp.autocast("cuda", dtype=dtype, enabled=(device.type == "cuda")):
+                        logits = model(input_ids, attention_mask)
+                        preds = torch.argmax(logits, dim=-1)
 
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
+                    correct += (preds == labels).sum().item()
+                    total += labels.size(0)
 
-        val_acc = (correct / max(1, total)) * 100.0
-        print(f"\n[Epoch {epoch} Results] Validation Accuracy: {val_acc:.2f}% (Best: {max(best_acc, val_acc):.2f}%)\n")
-        if val_acc > best_acc:
-            best_acc = val_acc
+            val_acc = (correct / max(1, total)) * 100.0
+            print(f"\n[Epoch {epoch} Results] Validation Accuracy: {val_acc:.2f}% (Best: {max(best_acc, val_acc):.2f}%)\n")
+            if val_acc > best_acc:
+                best_acc = val_acc
 
-    # 6. Pack and Export Model into True 4-Bit Format
-    print("\nPacking General Purpose Jerry into true 4-bit uint8 format...")
-    packed_weights = pack_general_jerry(model, group_size=group_size)
+    # 6. Pack and Export Model into True 4-Bit Format (Rank 0 only)
+    if is_master:
+        print("\nPacking General Purpose Jerry into true 4-bit uint8 format...")
+        base_model = model.module if hasattr(model, "module") else model
+        packed_weights = pack_general_jerry(base_model, group_size=group_size)
 
-    export_path = os.path.join(output_dir, "general_jerry_int4.pt")
-    torch.save(
-        {
-            "packed_state_dict": packed_weights,
-            "config": asdict(config),
-            "group_size": group_size,
-            "architecture": "GeneralJerryClassifier-W4A16",
-            "model_flavor": "General Purpose Jerry (Universal NLU & Zero-Shot)",
-            "classes": ["entailment", "neutral", "contradiction"],
-            "val_accuracy": best_acc,
-        },
-        export_path,
-    )
-    size_mb = os.path.getsize(export_path) / (1024 * 1024)
-    print(f"  [OK] Saved General Purpose Jerry packed weights -> {export_path} ({size_mb:.1f} MB)")
+        export_path = os.path.join(output_dir, "general_jerry_int4.pt")
+        torch.save(
+            {
+                "packed_state_dict": packed_weights,
+                "config": asdict(config),
+                "group_size": group_size,
+                "architecture": "GeneralJerryClassifier-W4A16",
+                "model_flavor": "General Purpose Jerry (Universal NLU & Zero-Shot)",
+                "classes": ["entailment", "neutral", "contradiction"],
+                "val_accuracy": best_acc,
+            },
+            export_path,
+        )
+        size_mb = os.path.getsize(export_path) / (1024 * 1024)
+        print(f"  [OK] Saved General Purpose Jerry packed weights -> {export_path} ({size_mb:.1f} MB)")
 
     # Save tokenizer and config
     with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
@@ -387,33 +442,39 @@ print(result) # {{'label': 'Positive', 'confidence': 0.94}}
         f.write(readme_content)
     print(f"  [OK] Generated model card -> {os.path.join(output_dir, 'README.md')}")
 
-    # Optional Upload
-    token = hf_token or os.environ.get("HF_TOKEN", "")
-    if upload and token:
-        print(f"\nUploading General Purpose Jerry to Hugging Face: {hf_repo} ...")
-        try:
-            api = HfApi(token=token)
-            api.create_repo(repo_id=hf_repo, repo_type="model", exist_ok=True)
-            api.upload_folder(
-                folder_path=output_dir,
-                repo_id=hf_repo,
-                path_in_repo="GeneralPurposeJerry",
-                repo_type="model",
-                commit_message=f"Upload General Purpose Jerry INT4 W4A16 NLU Model ({size_mb:.1f}MB, Acc: {best_acc:.2f}%)",
-            )
-            print(f"  [SUCCESS] Published to https://huggingface.co/{hf_repo}/tree/main/GeneralPurposeJerry")
-        except Exception as e:
-            print(f"  [Upload Error] {e}")
+    # Optional Upload (Master rank only)
+    if is_master:
+        token = hf_token or os.environ.get("HF_TOKEN", "")
+        if upload and token:
+            print(f"\nUploading General Purpose Jerry to Hugging Face: {hf_repo} ...")
+            try:
+                api = HfApi(token=token)
+                api.create_repo(repo_id=hf_repo, repo_type="model", exist_ok=True)
+                api.upload_folder(
+                    folder_path=output_dir,
+                    repo_id=hf_repo,
+                    path_in_repo="GeneralPurposeJerry",
+                    repo_type="model",
+                    commit_message=f"Upload General Purpose Jerry INT4 W4A16 NLU Model ({size_mb:.1f}MB, Acc: {best_acc:.2f}%)",
+                )
+                print(f"  [SUCCESS] Published to https://huggingface.co/{hf_repo}/tree/main/GeneralPurposeJerry")
+            except Exception as e:
+                print(f"  [Upload Error] {e}")
+
+    if is_ddp:
+        import torch.distributed as dist
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train and Export General Purpose Jerry")
     parser.add_argument("--base_checkpoint", type=str, default="bert_checkpoints/latest_bert.pt")
-    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--group_size", type=int, default=64)
-    parser.add_argument("--max_samples", type=int, default=100000)
+    parser.add_argument("--max_samples", type=int, default=0, help="0 for full MNLI dataset (392k pairs)")
     parser.add_argument("--out_dir", type=str, default="exported_models/GeneralJerry")
     parser.add_argument("--hf_repo", type=str, default="Amogh1221/Jerry")
     parser.add_argument("--upload", action="store_true")
