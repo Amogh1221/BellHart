@@ -78,12 +78,30 @@ def train_small_jerry(
     upload: bool = False,
     hf_token: str = "",
 ):
-    print(f"\n{'='*65}")
-    print("  TRAINING SMALLJERRY: INT4 (W4A16) QAT BASE FOUNDATION MODEL")
-    print(f"{'='*65}\n")
+    # 0. Distributed Data Parallel (DDP) Detection
+    is_ddp = int(os.environ.get("RANK", -1)) != -1
+    if is_ddp:
+        import torch.distributed as dist
+        dist.init_process_group(backend="nccl")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        is_master = (rank == 0)
+    else:
+        rank = 0
+        local_rank = 0
+        world_size = 1
+        is_master = True
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(output_dir, exist_ok=True)
+    if is_master:
+        print(f"\n{'='*65}")
+        print("  TRAINING SMALLJERRY: INT4 (W4A16) QAT BASE FOUNDATION MODEL")
+        print(f"{'='*65}\n")
+        print(f"Device: {device} | DDP: {is_ddp} (World Size: {world_size})\n")
+        os.makedirs(output_dir, exist_ok=True)
 
     # 1. Load Tokenizer & Config
     tokenizer = Tokenizer()
@@ -92,13 +110,15 @@ def train_small_jerry(
     config.dtype = "bfloat16" if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "float16"
 
     # 2. Instantiate ModernBertModel and load FP16 base weights
-    print(f"Loading base pre-trained weights from: {base_checkpoint} ...")
+    if is_master:
+        print(f"Loading base pre-trained weights from: {base_checkpoint} ...")
     if not os.path.exists(base_checkpoint):
         candidates = sorted(Path("bert_checkpoints").glob("bert-[0-9]*.pt"))
         if candidates:
             base_checkpoint = str(candidates[-1])
         else:
-            print(f"Checkpoint '{base_checkpoint}' not found locally. Checking Hugging Face (Amogh1221/bellhart_training)...")
+            if is_master:
+                print(f"Checkpoint '{base_checkpoint}' not found locally. Checking Hugging Face (Amogh1221/bellhart_training)...")
             try:
                 from huggingface_hub import hf_hub_download
                 token = hf_token or os.environ.get("HF_TOKEN", "")
@@ -110,23 +130,36 @@ def train_small_jerry(
                     local_dir=".",
                 )
                 base_checkpoint = downloaded
-                print(f"  [OK] Successfully downloaded latest checkpoint -> {base_checkpoint}")
+                if is_master:
+                    print(f"  [OK] Successfully downloaded latest checkpoint -> {base_checkpoint}")
             except Exception as e:
                 raise FileNotFoundError(f"Base checkpoint not found at: {base_checkpoint} ({e})")
+
+    if is_ddp:
+        import torch.distributed as dist
+        dist.barrier()
 
     ckpt = torch.load(base_checkpoint, map_location="cpu", weights_only=False)
     model = ModernBertModel(config)
     model.load_state_dict(ckpt["model_state_dict"], strict=True)
-    print(f"  [OK] Successfully loaded base weights (from step {ckpt.get('step', 'N/A')}).")
+    if is_master:
+        print(f"  [OK] Successfully loaded base weights (from step {ckpt.get('step', 'N/A')}).")
 
     # 3. Apply INT4 W4A16 Quantization-Aware Training (QAT)
-    print(f"Applying INT4 W4A16 Group-Wise QAT (group_size={group_size}) to Linear layers...")
+    if is_master:
+        print(f"Applying INT4 W4A16 Group-Wise QAT (group_size={group_size}) to Linear layers...")
     apply_qat_to_modernbert(model, group_size=group_size)
     model = model.to(device)
-    print("  [OK] Attention and SwiGLU projections converted to FakeQuantLinearW4A16.")
+    if is_master:
+        print("  [OK] Attention and SwiGLU projections converted to FakeQuantLinearW4A16.")
 
-    # 4. Setup Streaming MLM Dataset for QAT Cooldown
-    print("Initializing streaming MLM dataset (openbmb/Ultra-FineWeb-L1) for QAT cooldown...")
+    if is_ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(model, device_ids=[local_rank], gradient_as_bucket_view=True)
+
+    # 4. Setup Streaming MLM Dataset for QAT Cooldown with rank partitioning
+    if is_master:
+        print("Initializing streaming MLM dataset (openbmb/Ultra-FineWeb-L1) for QAT cooldown...")
     dataset = BertStreamingDataset(
         dataset_name="openbmb/Ultra-FineWeb-L1",
         split="train",
@@ -134,6 +167,8 @@ def train_small_jerry(
         block_size=config.block_size,
         mask_prob=config.mask_prob,
         seed=2026,
+        rank=rank,
+        world_size=world_size,
     )
     dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=0, pin_memory=True)
     data_iter = iter(dataloader)
@@ -146,10 +181,14 @@ def train_small_jerry(
 
     # 6. QAT Cooldown Loop
     model.train()
-    print(f"\nCommencing {steps:,} QAT adaptation steps (Initial LR: {learning_rate:.1e} -> 1.0e-6)...")
-    pbar = tqdm(range(1, steps + 1), desc="SmallJerry QAT", dynamic_ncols=True)
+    # Dynamic accumulation so total effective tokens per step is constant across 1 or 2 GPUs (16,384 tokens)
+    accum_steps = max(1, 16 // (batch_size * world_size))
+    if is_master:
+        print(f"\nCommencing {steps:,} QAT adaptation steps (Initial LR: {learning_rate:.1e} -> 1.0e-6)...")
+        print(f"GPUs: {world_size} | Per-GPU Batch: {batch_size} | Gradient Accumulation: {accum_steps} | Tokens/step: {batch_size * world_size * accum_steps * config.block_size:,}\n")
 
-    accum_steps = 4
+    pbar = tqdm(range(1, steps + 1), desc="SmallJerry QAT", dynamic_ncols=True) if is_master else range(1, steps + 1)
+
     running_loss = 0.0
     t0 = time.time()
 
@@ -184,33 +223,36 @@ def train_small_jerry(
         scheduler.step()
 
         running_loss = 0.95 * running_loss + 0.05 * step_loss if running_loss > 0 else step_loss
-        cur_lr = scheduler.get_last_lr()[0]
-        pbar.set_postfix({"mlm_loss": f"{running_loss:.4f}", "ppl": f"{math.exp(min(running_loss, 20.0)):.2f}", "lr": f"{cur_lr:.1e}"})
+        if is_master:
+            cur_lr = scheduler.get_last_lr()[0]
+            pbar.set_postfix({"mlm_loss": f"{running_loss:.4f}", "ppl": f"{math.exp(min(running_loss, 20.0)):.2f}", "lr": f"{cur_lr:.1e}"})
 
-    pbar.close()
-    elapsed = time.time() - t0
-    print(f"\n[QAT Complete] Adapted model over {steps:,} steps in {elapsed/60:.1f} minutes.")
-    print(f"Final MLM Loss: {running_loss:.4f} (Perplexity: {math.exp(min(running_loss, 20.0)):.2f})")
+    if is_master:
+        pbar.close()
+        elapsed = time.time() - t0
+        print(f"\n[QAT Complete] Adapted model over {steps:,} steps in {elapsed/60:.1f} minutes ({steps/elapsed:.2f} it/s).")
+        print(f"Final MLM Loss: {running_loss:.4f} (Perplexity: {math.exp(min(running_loss, 20.0)):.2f})")
 
-    # 7. Pack and Export SmallJerry into True 4-Bit Format (~55 MB)
-    print("\nPacking weights into true 4-bit uint8 storage...")
-    packed_weights = pack_small_jerry_model(model, group_size=group_size)
+        # 7. Pack and Export SmallJerry into True 4-Bit Format (~55 MB)
+        print("\nPacking weights into true 4-bit uint8 storage...")
+        base_model = model.module if hasattr(model, "module") else model
+        packed_weights = pack_small_jerry_model(base_model, group_size=group_size)
 
-    export_path = os.path.join(output_dir, "small_jerry_int4.pt")
-    torch.save(
-        {
-            "packed_state_dict": packed_weights,
-            "config": asdict(config),
-            "group_size": group_size,
-            "architecture": "ModernBertModel-W4A16",
-            "model_flavor": "SmallJerry (Pure Quantized Base Foundation)",
-            "final_mlm_loss": running_loss,
-            "final_ppl": math.exp(min(running_loss, 20.0)),
-        },
-        export_path,
-    )
-    size_mb = os.path.getsize(export_path) / (1024 * 1024)
-    print(f"  [OK] Saved SmallJerry packed weights -> {export_path} ({size_mb:.1f} MB)")
+        export_path = os.path.join(output_dir, "small_jerry_int4.pt")
+        torch.save(
+            {
+                "packed_state_dict": packed_weights,
+                "config": asdict(config),
+                "group_size": group_size,
+                "architecture": "ModernBertModel-W4A16",
+                "model_flavor": "SmallJerry (Pure Quantized Base Foundation)",
+                "final_mlm_loss": running_loss,
+                "final_ppl": math.exp(min(running_loss, 20.0)),
+            },
+            export_path,
+        )
+        size_mb = os.path.getsize(export_path) / (1024 * 1024)
+        print(f"  [OK] Saved SmallJerry packed weights -> {export_path} ({size_mb:.1f} MB)")
 
     # Save config and tokenizer
     with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
@@ -277,23 +319,29 @@ model.eval()
         f.write(readme_content)
     print(f"  [OK] Generated model card -> {os.path.join(output_dir, 'README.md')}")
 
-    # Optional Upload
-    token = hf_token or os.environ.get("HF_TOKEN", "")
-    if upload and token:
-        print(f"\nUploading SmallJerry to Hugging Face: {hf_repo} ...")
-        try:
-            api = HfApi(token=token)
-            api.create_repo(repo_id=hf_repo, repo_type="model", exist_ok=True)
-            api.upload_folder(
-                folder_path=output_dir,
-                repo_id=hf_repo,
-                path_in_repo="SmallJerry",
-                repo_type="model",
-                commit_message=f"Upload SmallJerry INT4 W4A16 QAT Base Model ({size_mb:.1f}MB)",
-            )
-            print(f"  [SUCCESS] SmallJerry published to https://huggingface.co/{hf_repo}/tree/main/SmallJerry")
-        except Exception as e:
-            print(f"  [Upload Error] {e}")
+    # Optional Upload (Master rank only)
+    if is_master:
+        token = hf_token or os.environ.get("HF_TOKEN", "")
+        if upload and token:
+            print(f"\nUploading SmallJerry to Hugging Face: {hf_repo} ...")
+            try:
+                api = HfApi(token=token)
+                api.create_repo(repo_id=hf_repo, repo_type="model", exist_ok=True)
+                api.upload_folder(
+                    folder_path=output_dir,
+                    repo_id=hf_repo,
+                    path_in_repo="SmallJerry",
+                    repo_type="model",
+                    commit_message=f"Upload SmallJerry INT4 W4A16 QAT Base Model ({size_mb:.1f}MB)",
+                )
+                print(f"  [SUCCESS] SmallJerry published to https://huggingface.co/{hf_repo}/tree/main/SmallJerry")
+            except Exception as e:
+                print(f"  [Upload Error] {e}")
+
+    if is_ddp:
+        import torch.distributed as dist
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def main():

@@ -16,53 +16,22 @@ import torch.nn.functional as F
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1. Straight-Through Estimator (STE) Autograd Function
+# 1. Straight-Through Estimator (STE) Function
 # ──────────────────────────────────────────────────────────────────────────────
 
-class FakeQuantW4A16Function(torch.autograd.Function):
-    """
-    Symmetric Group-Wise 4-bit Weight Fake-Quantization:
-      - Signed 4-bit range: [-8, 7]
-      - Straight-Through Estimator (STE) for backpropagation
-      - Clipped gradients outside range [-8.5, 7.5]
-    """
-
-    @staticmethod
-    def forward(ctx, weight: torch.Tensor, group_size: int = 64) -> torch.Tensor:
-        out_features, in_features = weight.shape
-        num_groups = in_features // group_size
-
-        # Reshape to [out_features * num_groups, group_size]
-        w_groups = weight.view(-1, group_size)
-
-        # Dynamic per-group absolute maximum scale aligned to weight dtype
-        max_val = torch.clamp(w_groups.abs().amax(dim=-1, keepdim=True), min=1e-7)
-        scales = (max_val / 7.0).to(weight.dtype)
-
-        # Quantize to 4-bit integer grid [-8, 7]
-        q = torch.clamp(torch.round(w_groups / scales), -8.0, 7.0)
-
-        # Save for backward pass
-        ctx.save_for_backward(w_groups, scales)
-
-        # Dequantize back to float for computation
-        w_dequant = (q * scales).view(out_features, in_features)
-        return w_dequant
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None]:
-        w_groups, scales = ctx.saved_tensors
-        # Normalized weight position relative to quantization bins
-        norm_w = w_groups / scales
-        # STE with gradient saturation mask
-        grad_mask = (norm_w >= -8.5) & (norm_w <= 7.5)
-        grad_weight = grad_output.view_as(w_groups) * grad_mask.float()
-        return grad_weight.view_as(grad_output), None
-
-
 def fake_quant_w4a16(weight: torch.Tensor, group_size: int = 64) -> torch.Tensor:
-    """Applies group-wise 4-bit fake quantization using STE."""
-    return FakeQuantW4A16Function.apply(weight, group_size)
+    """
+    Applies group-wise 4-bit fake quantization using native Straight-Through Estimator (STE).
+    (w_quant - weight).detach() + weight yields exact w_quant in forward pass,
+    while passing gradients directly to weight in backward pass with zero Python autograd overhead.
+    """
+    out_features, in_features = weight.shape
+    w_groups = weight.view(-1, group_size)
+    max_val = torch.clamp(w_groups.abs().amax(dim=-1, keepdim=True), min=1e-7)
+    scales = (max_val / 7.0).to(weight.dtype)
+    q = torch.clamp(torch.round(w_groups / scales), -8.0, 7.0)
+    w_quant = (q * scales).view(out_features, in_features)
+    return weight + (w_quant - weight).detach()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
