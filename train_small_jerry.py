@@ -254,15 +254,15 @@ def train_small_jerry(
         size_mb = os.path.getsize(export_path) / (1024 * 1024)
         print(f"  [OK] Saved SmallJerry packed weights -> {export_path} ({size_mb:.1f} MB)")
 
-    # Save config and tokenizer
-    with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump(asdict(config), f, indent=2)
-    if os.path.exists("tokenizer.json"):
-        import shutil
-        shutil.copy2("tokenizer.json", os.path.join(output_dir, "tokenizer.json"))
+        # Save config and tokenizer
+        with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(asdict(config), f, indent=2)
+        if os.path.exists("tokenizer.json"):
+            import shutil
+            shutil.copy2("tokenizer.json", os.path.join(output_dir, "tokenizer.json"))
 
-    # Generate Model Card
-    readme_content = f"""---
+        # Generate Model Card
+        readme_content = f"""---
 language:
 - en
 license: mit
@@ -315,12 +315,11 @@ model.load_state_dict(unpacked_sd, strict=True)
 model.eval()
 ```
 """
-    with open(os.path.join(output_dir, "README.md"), "w", encoding="utf-8") as f:
-        f.write(readme_content)
-    print(f"  [OK] Generated model card -> {os.path.join(output_dir, 'README.md')}")
+        with open(os.path.join(output_dir, "README.md"), "w", encoding="utf-8") as f:
+            f.write(readme_content)
+        print(f"  [OK] Generated model card -> {os.path.join(output_dir, 'README.md')}")
 
-    # Optional Upload (Master rank only)
-    if is_master:
+        # Optional Upload (Master rank only)
         token = hf_token or os.environ.get("HF_TOKEN", "")
         if upload and token:
             print(f"\nUploading SmallJerry to Hugging Face: {hf_repo} ...")
